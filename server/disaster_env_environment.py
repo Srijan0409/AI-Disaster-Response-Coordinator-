@@ -17,7 +17,8 @@ This models a real Markov Decision Process:
   State:      victims + time_step + resources_available
   Action:     allocate_to (victim id, or -1 to skip)
   Transition: rescue victim, decay survival_time of others, kill if expired
-  Reward:     urgency bonus − distance penalty − death penalties
+   Reward:     shaped signal with urgency value, criticality/efficiency bonuses,
+              and penalties for deaths, risk build-up, and invalid actions
 """
 
 import random
@@ -65,9 +66,19 @@ DIFFICULTY_CONFIG: dict[str, dict] = {
     },
 }
 
-# Reward values
-URGENCY_REWARD  = {1: 0.3, 2: 0.6, 3: 1.0}
-URGENCY_DEATH_PENALTY = {1: 0.4, 2: 0.7, 3: 1.0}
+# Reward shaping values (normalised around [0.0, 1.0] per step).
+#
+# The dashboard requests a meaningful reward function with partial progress
+# signals. We therefore expose dense reward components:
+#   - rescue value (urgency)
+#   - urgency-time criticality bonus (rescuing just-in-time is worth more)
+#   - efficiency bonus (closer rescues are operationally better)
+#   - pressure signal (small penalty if urgent cases are left at risk)
+#   - death penalties (large setbacks, weighted by urgency)
+URGENCY_REWARD = {1: 0.30, 2: 0.60, 3: 0.85}
+URGENCY_DEATH_PENALTY = {1: 0.25, 2: 0.55, 3: 0.85}
+SKIP_PENALTY = 0.08
+INVALID_ACTION_PENALTY = 0.12
 
 
 class DisasterEnvironment(Environment):
@@ -193,39 +204,51 @@ class DisasterEnvironment(Environment):
             raise RuntimeError("Episode has ended. Call reset() to start a new one.")
 
         self._state.step_count += 1
-        reward = 0.0
+       raw_reward = 0.0
         info: dict[str, Any] = {
             "rescued": False,
             "died": [],
             "invalid": False,
             "skipped": False,
+        "reward_components": {
+                "rescue_value": 0.0,
+                "criticality_bonus": 0.0,
+                "efficiency_bonus": 0.0,
+                "pressure_penalty": 0.0,
+                "deaths_penalty": 0.0,
+                "action_penalty": 0.0,
+            },
         }
 
         victim_id = action.allocate_to
 
         # ── Validate and execute allocation ───────────────────────────────────
         if victim_id == -1:
-            reward -= 0.05
+            raw_reward -= SKIP_PENALTY
             info["skipped"] = True
+          info["reward_components"]["action_penalty"] = SKIP_PENALTY
 
         elif self._resources_available <= 0:
-            reward -= 0.1
+            raw_reward -= INVALID_ACTION_PENALTY
             info["invalid"] = True
             info["reason"] = "no_resources"
+            info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
 
         else:
             target = self._find_victim(victim_id)
 
             if target is None:
-                reward -= 0.15
+              raw_reward -= INVALID_ACTION_PENALTY
                 info["invalid"] = True
                 info["reason"] = "victim_not_found"
+                info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
 
             elif not target.alive or target.rescued:
-                reward -= 0.15
+                raw_reward -= INVALID_ACTION_PENALTY
                 info["invalid"] = True
                 info["reason"] = "victim_unavailable"
-
+                info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
+              
             else:
                 # ── Successful rescue ─────────────────────────────────────
                 target.rescued = True
@@ -233,12 +256,15 @@ class DisasterEnvironment(Environment):
                 self._resources_available -= 1
                 self._rescued_ids.add(victim_id)
 
-                # Reward: urgency bonus − distance penalty + time bonus
                 urgency_reward = URGENCY_REWARD[target.urgency]
-                distance_penalty = min(0.3, target.distance / 30.0)
-                time_bonus = 0.1 if target.survival_time > 3 else 0.0
+                criticality_bonus = max(0.0, (4 - min(target.survival_time, 4)) * 0.05)
+                efficiency_bonus = max(0.0, (10.0 - target.distance) / 100.0)
 
-                reward += urgency_reward - distance_penalty + time_bonus
+               raw_reward += urgency_reward + criticality_bonus + efficiency_bonus
+                info["reward_components"]["rescue_value"] = round(urgency_reward, 4)
+                info["reward_components"]["criticality_bonus"] = round(criticality_bonus, 4)
+                info["reward_components"]["efficiency_bonus"] = round(efficiency_bonus, 4)
+              
                 info["rescued"] = True
                 info["rescued_id"] = victim_id
                 info["urgency"] = target.urgency
@@ -258,15 +284,32 @@ class DisasterEnvironment(Environment):
                 self._dead_ids.add(v.id)
                 died_this_step.append(v.id)
                 # Death penalty proportional to urgency
-                reward -= 0.5 * URGENCY_DEATH_PENALTY[v.urgency]
+                raw_reward -= URGENCY_DEATH_PENALTY[v.urgency]
+                info["reward_components"]["deaths_penalty"] = round(
+                info["reward_components"]["deaths_penalty"] + URGENCY_DEATH_PENALTY[v.urgency],
+                    4,
+                )
+
+        info["died"] = died_this_step
+        living = [v for v in self._victims if v.alive and not v.rescued]
+
+        if living:
+            at_risk = [
+                v for v in living
+                if (v.urgency >= 2 and v.survival_time <= 2) or (v.urgency == 3 and v.survival_time <= 3)
+            ]
+            pressure_penalty = min(0.18, 0.04 * len(at_risk))
+            raw_reward -= pressure_penalty
+            info["reward_components"]["pressure_penalty"] = round(pressure_penalty, 4)
 
         info["died"] = died_this_step
 
         # ── Check episode termination ──────────────────────────────────────────
-        living = [v for v in self._victims if v.alive and not v.rescued]
         if self._time_step >= self._config["max_steps"] or not living:
             self._done = True
 
+        reward = max(0.0, min(1.0, raw_reward))
+        info["raw_reward"] = round(raw_reward, 4)
         self._episode_reward += reward
         return self._make_observation(reward=round(reward, 4), info=info)
 
