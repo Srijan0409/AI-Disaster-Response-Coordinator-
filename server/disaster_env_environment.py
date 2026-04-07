@@ -8,17 +8,10 @@
 AI Disaster Response Coordinator — Environment Implementation.
 
 A reinforcement learning environment that simulates emergency triage:
-  - Victims have urgency (1–3), distance (km), and survival_time (steps)
+  - Victims have urgency (1-3), distance (km), and survival_time (steps)
   - The agent allocates limited rescue teams each step
   - Victims die if not rescued in time, triggering death penalties
   - Three difficulty levels (easy / medium / hard) control scenario parameters
-
-This models a real Markov Decision Process:
-  State:      victims + time_step + resources_available
-  Action:     allocate_to (victim id, or -1 to skip)
-  Transition: rescue victim, decay survival_time of others, kill if expired
-   Reward:     shaped signal with urgency value, criticality/efficiency bonuses,
-              and penalties for deaths, risk build-up, and invalid actions
 """
 
 import random
@@ -34,7 +27,7 @@ except ImportError:
     from models import DisasterAction, DisasterObservation, VictimState
 
 
-# ─── Difficulty configuration ────────────────────────────────────────────────
+# --- Difficulty configuration ------------------------------------------------
 
 DIFFICULTY_CONFIG: dict[str, dict] = {
     "easy": {
@@ -42,7 +35,7 @@ DIFFICULTY_CONFIG: dict[str, dict] = {
         "num_resources": 2,
         "max_steps": 12,
         "survival_time_range": (6, 12),
-        "urgency_weights": [0.5, 0.3, 0.2],   # mostly low urgency — forgiving
+        "urgency_weights": [0.5, 0.3, 0.2],
         "distance_range": (1.0, 5.0),
         "time_decay": 1,
     },
@@ -51,7 +44,7 @@ DIFFICULTY_CONFIG: dict[str, dict] = {
         "num_resources": 2,
         "max_steps": 10,
         "survival_time_range": (4, 9),
-        "urgency_weights": [0.3, 0.4, 0.3],   # balanced
+        "urgency_weights": [0.3, 0.4, 0.3],
         "distance_range": (1.0, 8.0),
         "time_decay": 1,
     },
@@ -60,21 +53,12 @@ DIFFICULTY_CONFIG: dict[str, dict] = {
         "num_resources": 2,
         "max_steps": 8,
         "survival_time_range": (2, 6),
-        "urgency_weights": [0.2, 0.3, 0.5],   # mostly critical — time pressure
+        "urgency_weights": [0.2, 0.3, 0.5],
         "distance_range": (1.0, 10.0),
-        "time_decay": 2,                        # survival time drops 2/step
+        "time_decay": 2,
     },
 }
 
-# Reward shaping values (normalised around [0.0, 1.0] per step).
-#
-# The dashboard requests a meaningful reward function with partial progress
-# signals. We therefore expose dense reward components:
-#   - rescue value (urgency)
-#   - urgency-time criticality bonus (rescuing just-in-time is worth more)
-#   - efficiency bonus (closer rescues are operationally better)
-#   - pressure signal (small penalty if urgent cases are left at risk)
-#   - death penalties (large setbacks, weighted by urgency)
 URGENCY_REWARD = {1: 0.30, 2: 0.60, 3: 0.85}
 URGENCY_DEATH_PENALTY = {1: 0.25, 2: 0.55, 3: 0.85}
 SKIP_PENALTY = 0.08
@@ -92,23 +76,13 @@ class DisasterEnvironment(Environment):
       - A fixed number of rescue teams per step
 
     Supports three difficulty levels:
-      easy   — 4 victims, forgiving survival times, short distances
-      medium — 5 victims, balanced scenario
-      hard   — 7 victims, critical urgency dominates, fast time decay
+      easy   - 4 victims, forgiving survival times, short distances
+      medium - 5 victims, balanced scenario
+      hard   - 7 victims, critical urgency dominates, fast time decay
 
     Episode ends when:
       - All victims are rescued or dead, OR
       - max_steps is reached
-
-    Example:
-        >>> env = DisasterEnvironment()
-        >>> obs = env.reset()
-        >>> print(obs.victims)           # list of VictimState
-        >>> print(obs.resources_available)  # 2
-
-        >>> obs2 = env.step(DisasterAction(allocate_to=0))
-        >>> print(obs2.reward)           # reward for rescuing victim 0
-        >>> print(obs2.episode_done)     # False (usually)
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -120,7 +94,6 @@ class DisasterEnvironment(Environment):
         self._config: dict = DIFFICULTY_CONFIG["medium"]
         self._rng: random.Random = random.Random()
 
-        # Live episode state
         self._victims: list[VictimState] = []
         self._time_step: int = 0
         self._resources_available: int = 2
@@ -129,7 +102,7 @@ class DisasterEnvironment(Environment):
         self._rescued_ids: set[int] = set()
         self._dead_ids: set[int] = set()
 
-    # ── Reset ─────────────────────────────────────────────────────────────────
+    # --- Reset ----------------------------------------------------------------
 
     def reset(
         self,
@@ -155,7 +128,6 @@ class DisasterEnvironment(Environment):
         self._config = DIFFICULTY_CONFIG[difficulty]
         self._rng = random.Random(seed)
 
-        # Reset episode counters
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._time_step = 0
         self._resources_available = self._config["num_resources"]
@@ -164,7 +136,6 @@ class DisasterEnvironment(Environment):
         self._rescued_ids = set()
         self._dead_ids = set()
 
-        # Generate victims
         cfg = self._config
         st_min, st_max = cfg["survival_time_range"]
         d_min, d_max = cfg["distance_range"]
@@ -185,7 +156,7 @@ class DisasterEnvironment(Environment):
 
         return self._make_observation(reward=0.0, info=None)
 
-    # ── Step ──────────────────────────────────────────────────────────────────
+    # --- Step -----------------------------------------------------------------
 
     def step(self, action: DisasterAction) -> DisasterObservation:  # type: ignore[override]
         """
@@ -204,13 +175,13 @@ class DisasterEnvironment(Environment):
             raise RuntimeError("Episode has ended. Call reset() to start a new one.")
 
         self._state.step_count += 1
-       raw_reward = 0.0
+        raw_reward = 0.0
         info: dict[str, Any] = {
             "rescued": False,
             "died": [],
             "invalid": False,
             "skipped": False,
-        "reward_components": {
+            "reward_components": {
                 "rescue_value": 0.0,
                 "criticality_bonus": 0.0,
                 "efficiency_bonus": 0.0,
@@ -222,11 +193,11 @@ class DisasterEnvironment(Environment):
 
         victim_id = action.allocate_to
 
-        # ── Validate and execute allocation ───────────────────────────────────
+        # --- Validate and execute allocation ----------------------------------
         if victim_id == -1:
             raw_reward -= SKIP_PENALTY
             info["skipped"] = True
-          info["reward_components"]["action_penalty"] = SKIP_PENALTY
+            info["reward_components"]["action_penalty"] = SKIP_PENALTY
 
         elif self._resources_available <= 0:
             raw_reward -= INVALID_ACTION_PENALTY
@@ -238,7 +209,7 @@ class DisasterEnvironment(Environment):
             target = self._find_victim(victim_id)
 
             if target is None:
-              raw_reward -= INVALID_ACTION_PENALTY
+                raw_reward -= INVALID_ACTION_PENALTY
                 info["invalid"] = True
                 info["reason"] = "victim_not_found"
                 info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
@@ -248,9 +219,9 @@ class DisasterEnvironment(Environment):
                 info["invalid"] = True
                 info["reason"] = "victim_unavailable"
                 info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
-              
+
             else:
-                # ── Successful rescue ─────────────────────────────────────
+                # --- Successful rescue ----------------------------------------
                 target.rescued = True
                 target.alive = False
                 self._resources_available -= 1
@@ -260,16 +231,16 @@ class DisasterEnvironment(Environment):
                 criticality_bonus = max(0.0, (4 - min(target.survival_time, 4)) * 0.05)
                 efficiency_bonus = max(0.0, (10.0 - target.distance) / 100.0)
 
-               raw_reward += urgency_reward + criticality_bonus + efficiency_bonus
+                raw_reward += urgency_reward + criticality_bonus + efficiency_bonus
                 info["reward_components"]["rescue_value"] = round(urgency_reward, 4)
                 info["reward_components"]["criticality_bonus"] = round(criticality_bonus, 4)
                 info["reward_components"]["efficiency_bonus"] = round(efficiency_bonus, 4)
-              
+
                 info["rescued"] = True
                 info["rescued_id"] = victim_id
                 info["urgency"] = target.urgency
 
-        # ── Advance time: decay survival_time of all living victims ───────────
+        # --- Advance time: decay survival_time of all living victims ----------
         self._time_step += 1
         self._resources_available = self._config["num_resources"]  # reset each step
         decay = self._config["time_decay"]
@@ -283,10 +254,9 @@ class DisasterEnvironment(Environment):
                 v.alive = False
                 self._dead_ids.add(v.id)
                 died_this_step.append(v.id)
-                # Death penalty proportional to urgency
                 raw_reward -= URGENCY_DEATH_PENALTY[v.urgency]
                 info["reward_components"]["deaths_penalty"] = round(
-                info["reward_components"]["deaths_penalty"] + URGENCY_DEATH_PENALTY[v.urgency],
+                    info["reward_components"]["deaths_penalty"] + URGENCY_DEATH_PENALTY[v.urgency],
                     4,
                 )
 
@@ -302,9 +272,7 @@ class DisasterEnvironment(Environment):
             raw_reward -= pressure_penalty
             info["reward_components"]["pressure_penalty"] = round(pressure_penalty, 4)
 
-        info["died"] = died_this_step
-
-        # ── Check episode termination ──────────────────────────────────────────
+        # --- Check episode termination ----------------------------------------
         if self._time_step >= self._config["max_steps"] or not living:
             self._done = True
 
@@ -313,20 +281,21 @@ class DisasterEnvironment(Environment):
         self._episode_reward += reward
         return self._make_observation(reward=round(reward, 4), info=info)
 
-    # ── State ─────────────────────────────────────────────────────────────────
+    # --- State ----------------------------------------------------------------
 
     @property
     def state(self) -> State:
         """Current OpenEnv State with episode_id and step_count."""
         return self._state
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # --- Internal helpers -----------------------------------------------------
 
     def _make_observation(
         self,
         reward: float,
         info: dict | None,
     ) -> DisasterObservation:
+        """Build a DisasterObservation from current episode state."""
         return DisasterObservation(
             time_step=self._time_step,
             resources_available=self._resources_available,
@@ -335,9 +304,6 @@ class DisasterEnvironment(Environment):
             victims=list(self._victims),
             episode_done=self._done,
             last_action_info=info,
-            done=self._done,
-            reward=reward,
-            metadata=self._episode_summary(),
         )
 
     def _find_victim(self, victim_id: int) -> VictimState | None:
