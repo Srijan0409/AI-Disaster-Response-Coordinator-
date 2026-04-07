@@ -1,6 +1,6 @@
 ---
-title: Disaster Env Environment Server
-emoji: 📡
+title: AI Disaster Response Coordinator
+emoji: 🚨
 colorFrom: pink
 colorTo: indigo
 sdk: docker
@@ -11,58 +11,47 @@ tags:
   - openenv
 ---
 
-# Disaster Env Environment
+# AI Disaster Response Coordinator
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+A reinforcement learning environment that simulates emergency disaster triage across real Uttarakhand locations. An AI agent allocates limited rescue teams to victims with varying urgency levels, distances, and survival times — under strict time pressure.
 
 ## Quick Start
 
-The simplest way to use the Disaster Env environment is through the `DisasterEnv` class:
+The simplest way to use the environment is through the `DisasterEnv` class:
 
 ```python
 from disaster_env import DisasterAction, DisasterEnv
 
-try:
-    # Create environment from Docker image
-    disaster_envenv = DisasterEnv.from_docker_image("disaster_env-env:latest")
+with DisasterEnv(base_url="http://localhost:8000") as env:
+    # Reset with difficulty and seed
+    result = env.reset(difficulty="medium", seed=42)
+    obs = result.observation
 
-    # Reset
-    result = disaster_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
+    print(f"Victims: {len(obs.victims)}")
+    print(f"Resources available: {obs.resources_available}")
 
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
+    # Pick the most critical alive victim
+    alive = [v for v in obs.victims if v.alive and not v.rescued]
+    target = max(alive, key=lambda v: v.urgency)
 
-    for msg in messages:
-        result = disaster_envenv.step(DisasterAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
-
-finally:
-    # Always clean up
-    disaster_envenv.close()
+    # Rescue them
+    result = env.step(DisasterAction(allocate_to=target.id))
+    print(f"Reward: {result.reward}")
+    print(f"Done: {result.done}")
 ```
-
-That's it! The `DisasterEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
 
 ## Building the Docker Image
 
-Before using the environment, you need to build the Docker image:
+Before using the environment locally, build the Docker image:
 
 ```bash
 # From project root
-docker build -t disaster_env-env:latest -f server/Dockerfile .
+docker build -t disaster_env-env:latest .
 ```
 
 ## Deploying to Hugging Face Spaces
 
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
+Deploy your environment to Hugging Face Spaces using the `openenv push` command:
 
 ```bash
 # From the environment directory (where openenv.yaml is located)
@@ -84,98 +73,138 @@ The `openenv push` command will:
 ### Options
 
 - `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
+- `--repo-id`, `-r`: Repository ID in format `username/repo-name` (defaults to `username/env-name` from openenv.yaml)
 - `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
 - `--private`: Deploy the space as private (default: public)
 
 ### Examples
 
 ```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
+# Push to your personal namespace
 openenv push
 
 # Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
+openenv push --repo-id my-org/disaster-env
 
 # Push as a private space
 openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
 ```
 
 After deployment, your space will be available at:
 `https://huggingface.co/spaces/<repo-id>`
 
 The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
+- **Web Interface** at `/web` — Interactive UI for exploring the environment
+- **API Documentation** at `/docs` — Full OpenAPI/Swagger interface
+- **Health Check** at `/health` — Container health monitoring
+- **WebSocket** at `/ws` — Persistent session endpoint for low-latency interactions
 
 ## Environment Details
 
 ### Action
-**DisasterAction**: Contains a single field
-- `message` (str) - The message to echo back
+
+**DisasterAction**: One field controls the agent's decision each step.
+- `allocate_to` (int) — Victim ID to send a rescue team to. Use `-1` to skip this step (incurs a small penalty).
 
 ### Observation
-**DisasterObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
+
+**DisasterObservation**: Full state of the disaster scenario returned after every `reset()` and `step()`.
+- `time_step` (int) — Current step number (0-indexed)
+- `resources_available` (int) — Rescue teams free this step
+- `max_steps` (int) — Total steps allowed this episode
+- `difficulty` (str) — Episode difficulty: `easy` | `medium` | `hard`
+- `victims` (list[VictimState]) — All victims and their current status
+- `episode_done` (bool) — Whether the episode has terminated
+- `last_action_info` (dict) — Info from the most recent step (rescued, died, invalid, reward components)
+
+### VictimState
+
+Each victim in the scenario has:
+- `id` (int) — Unique victim identifier
+- `urgency` (int) — `1`=low, `2`=medium, `3`=critical
+- `distance` (float) — Distance from rescue base in km (1.0–10.0)
+- `survival_time` (int) — Steps remaining before this victim dies if not rescued
+- `alive` (bool) — Whether the victim is still alive
+- `rescued` (bool) — Whether the victim has been rescued
 
 ### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
+
+The reward function is dense — a shaped signal is returned every step:
+
+| Component | Value |
+|---|---|
+| Rescue urgency=3 (critical) | +0.85 |
+| Rescue urgency=2 (medium) | +0.60 |
+| Rescue urgency=1 (low) | +0.30 |
+| Criticality bonus (rescuing just-in-time) | up to +0.20 |
+| Efficiency bonus (closer victim) | small positive |
+| Skip penalty (allocate_to=-1) | −0.08 |
+| Invalid action penalty | −0.12 |
+| Death penalty — urgency=3 | −0.85 |
+| Death penalty — urgency=2 | −0.55 |
+| Death penalty — urgency=1 | −0.25 |
+| Pressure penalty (urgent victims at risk) | up to −0.18 |
+
+Final reward per step is clamped to `[0.0, 1.0]`.
+
+## Difficulty Levels
+
+### Easy
+- 4 victims, mostly low urgency
+- Survival times: 6–12 steps
+- Distances: 1–5 km
+- 12 max steps, time decay: 1/step
+
+### Medium
+- 5 victims, balanced urgency distribution
+- Survival times: 4–9 steps
+- Distances: 1–8 km
+- 10 max steps, time decay: 1/step
+
+### Hard
+- 7 victims, mostly critical urgency
+- Survival times: 2–6 steps
+- Distances: 1–10 km
+- 8 max steps, time decay: 2/step (survival drops faster)
 
 ## Advanced Usage
 
 ### Connecting to an Existing Server
 
-If you already have a Disaster Env environment server running, you can connect directly:
-
 ```python
-from disaster_env import DisasterEnv
+from disaster_env import DisasterAction, DisasterEnv
 
-# Connect to existing server
-disaster_envenv = DisasterEnv(base_url="<ENV_HTTP_URL_HERE>")
+# Connect to a deployed HF Space or local server
+env = DisasterEnv(base_url="https://YOUR-USERNAME-disaster-env.hf.space")
 
-# Use as normal
-result = disaster_envenv.reset()
-result = disaster_envenv.step(DisasterAction(message="Hello!"))
+result = env.reset(difficulty="hard", seed=999)
+obs = result.observation
+
+result = env.step(DisasterAction(allocate_to=0))
+print(f"Reward: {result.reward}")
+
+env.close()
 ```
 
-Note: When connecting to an existing server, `disaster_envenv.close()` will NOT stop the server.
-
 ### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
 
 ```python
 from disaster_env import DisasterAction, DisasterEnv
 
-# Connect with context manager (auto-connects and closes)
 with DisasterEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(DisasterAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
+    result = env.reset(difficulty="easy", seed=42)
+    obs = result.observation
 
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
+    while not result.done:
+        # Greedy: rescue highest urgency alive victim
+        alive = [v for v in obs.victims if v.alive and not v.rescued]
+        if not alive:
+            break
+        target = max(alive, key=lambda v: (v.urgency, -v.survival_time))
+        result = env.step(DisasterAction(allocate_to=target.id))
+        obs = result.observation
+        print(f"Step {obs.time_step} — reward: {result.reward:.2f}")
+```
 
 ### Concurrent WebSocket Sessions
 
@@ -183,73 +212,92 @@ The server supports multiple concurrent WebSocket connections. To enable this,
 modify `server/app.py` to use factory mode:
 
 ```python
-# In server/app.py - use factory mode for concurrent sessions
+# In server/app.py — use factory mode for concurrent sessions
 app = create_app(
-    DisasterEnvironment,  # Pass class, not instance
+    DisasterEnvironment,   # Pass class, not instance
     DisasterAction,
     DisasterObservation,
     max_concurrent_envs=4,  # Allow 4 concurrent sessions
 )
 ```
 
-Then multiple clients can connect simultaneously:
+## Running the Inference Script
 
-```python
-from disaster_env import DisasterAction, DisasterEnv
-from concurrent.futures import ThreadPoolExecutor
+```bash
+# Set environment variables
+export API_BASE_URL=https://router.huggingface.co/v1
+export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+export HF_TOKEN=hf_xxxxxxxxxxxx
+export ENV_URL=https://YOUR-USERNAME-disaster-env.hf.space
 
-def run_episode(client_id: int):
-    with DisasterEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(DisasterAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
+# Run
+python inference.py
+```
 
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
+Expected stdout format:
+```
+[START] task=task1_nearest_first env=disaster_env model=Qwen/Qwen2.5-72B-Instruct
+[STEP] step=1 action=allocate_to=2 reward=0.85 done=false error=null
+[STEP] step=2 action=allocate_to=0 reward=0.62 done=false error=null
+...
+[END] success=true steps=7 score=0.743 rewards=0.85,0.62,...
 ```
 
 ## Development & Testing
 
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
+### Run Tests
 
 ```bash
 # From the server directory
+cd server
+python -m pytest tests/ -v
+```
+
+Test coverage includes:
+- Grid world mechanics (zone count, severity ranges, spread, spawning)
+- Grader scoring (rescue score, time penalty, wait penalty)
+- Task configuration (easy/medium/hard)
+- Constants validation (zones, resources, step limits)
+- Generator reproducibility (same seed → same scenario)
+
+### Test the Environment Directly
+
+```bash
+# Test core environment logic without the HTTP server
 python3 server/disaster_env_environment.py
 ```
 
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
-
-### Running Locally
-
-Run the server locally for development:
+### Run the Server Locally
 
 ```bash
-uvicorn server.app:app --reload
+uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ## Project Structure
 
 ```
 disaster_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # DisasterEnv client
-├── models.py              # Action and Observation models
+├── __init__.py                          # Module exports
+├── README.md                            # This file
+├── openenv.yaml                         # OpenEnv manifest
+├── pyproject.toml                       # Project metadata and dependencies
+├── inference.py                         # Baseline LLM inference script
+├── client.py                            # DisasterEnv client
+├── models.py                            # Action and Observation models
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── disaster_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── __init__.py                      # Server module exports
+    ├── app.py                           # FastAPI application (HTTP + WebSocket)
+    ├── disaster_env_environment.py      # Core RL environment logic
+    ├── constants.py                     # Shared zone/difficulty configuration
+    ├── generators.py                    # Scenario factory (civilians + resources)
+    ├── grid.py                          # Multi-zone GridWorld simulation
+    ├── grader.py                        # Episode scoring (0.0–1.0)
+    ├── tasks.py                         # Task definitions (easy/medium/hard)
+    ├── requirements.txt                 # Server dependencies
+    └── tests/
+        ├── test_constants.py
+        ├── test_generators.py
+        ├── test_grader.py
+        ├── test_grid.py
+        └── test_tasks.py
 ```
