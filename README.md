@@ -1,303 +1,286 @@
----
-title: AI Disaster Response Coordinator
-emoji: 🚨
-colorFrom: pink
-colorTo: indigo
-sdk: docker
-pinned: false
-app_port: 8000
-base_path: /web
-tags:
-  - openenv
----
-
 # AI Disaster Response Coordinator
 
-A reinforcement learning environment that simulates emergency disaster triage across real Uttarakhand locations. An AI agent allocates limited rescue teams to victims with varying urgency levels, distances, and survival times — under strict time pressure.
+An OpenEnv reinforcement-learning environment that simulates multi-zone emergency triage across real Uttarakhand disaster locations, based on the 2013 Kedarnath floods scenario.
 
-## Quick Start
+An AI agent acts as a disaster response coordinator: it observes active disaster zones, assesses victim urgency and zone severity, and dispatches rescue units (ambulances, rescue teams, helicopters) to maximise the number of survivors within a limited step budget.
 
-The simplest way to use the environment is through the `DisasterEnv` class:
+---
 
-```python
-from disaster_env import DisasterAction, DisasterEnv
+## Environment Description
 
-with DisasterEnv(base_url="http://localhost:8000") as env:
-    # Reset with difficulty and seed
-    result = env.reset(difficulty="medium", seed=42)
-    obs = result.observation
+The environment models a real-world emergency triage problem across five districts of Uttarakhand, India. Each episode presents the agent with one or more active disaster zones, each containing victims with varying urgency levels and survival times. The agent must prioritise zones and select appropriate rescue units to save as many lives as possible before the episode ends.
 
-    print(f"Victims: {len(obs.victims)}")
-    print(f"Resources available: {obs.resources_available}")
+**Key mechanics:**
+- Victims have individual urgency (1=low, 2=medium, 3=critical) and survival timers that count down each step
+- Disaster can spread to adjacent zones every N steps (medium and hard modes)
+- New victims spawn mid-episode in hard mode, requiring continuous re-prioritisation
+- Each rescue unit type rescues a different number of victims per step
+- Episode terminates when all victims are rescued/dead or the step budget is exhausted
 
-    # Pick the most critical alive victim
-    alive = [v for v in obs.victims if v.alive and not v.rescued]
-    target = max(alive, key=lambda v: v.urgency)
+**Real locations modelled:**
 
-    # Rescue them
-    result = env.step(DisasterAction(allocate_to=target.id))
-    print(f"Reward: {result.reward}")
-    print(f"Done: {result.done}")
-```
+| Zone | District | Disaster Type |
+|------|----------|---------------|
+| Kedarnath Temple Area | Rudraprayag | Flash flood |
+| Badrinath | Chamoli | Landslide |
+| Rishikesh | Dehradun | River overflow |
+| Joshimath | Chamoli | Land subsidence |
+| Dehradun City | Dehradun | Landslide |
+| Haridwar Ghat Area | Haridwar | River overflow |
+| Chamoli | Chamoli | Glacier burst |
 
-## Building the Docker Image
+---
 
-Before using the environment locally, build the Docker image:
+## Action Space
 
-```bash
-# From project root
-docker build -t disaster_env-env:latest .
-```
-
-## Deploying to Hugging Face Spaces
-
-Deploy your environment to Hugging Face Spaces using the `openenv push` command:
-
-```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
-```
-
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format `username/repo-name` (defaults to `username/env-name` from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
-
-```bash
-# Push to your personal namespace
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/disaster-env
-
-# Push as a private space
-openenv push --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` — Interactive UI for exploring the environment
-- **API Documentation** at `/docs` — Full OpenAPI/Swagger interface
-- **Health Check** at `/health` — Container health monitoring
-- **WebSocket** at `/ws` — Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-
-**DisasterAction**: One field controls the agent's decision each step.
-- `allocate_to` (int) — Victim ID to send a rescue team to. Use `-1` to skip this step (incurs a small penalty).
-
-### Observation
-
-**DisasterObservation**: Full state of the disaster scenario returned after every `reset()` and `step()`.
-- `time_step` (int) — Current step number (0-indexed)
-- `resources_available` (int) — Rescue teams free this step
-- `max_steps` (int) — Total steps allowed this episode
-- `difficulty` (str) — Episode difficulty: `easy` | `medium` | `hard`
-- `victims` (list[VictimState]) — All victims and their current status
-- `episode_done` (bool) — Whether the episode has terminated
-- `last_action_info` (dict) — Info from the most recent step (rescued, died, invalid, reward components)
-
-### VictimState
-
-Each victim in the scenario has:
-- `id` (int) — Unique victim identifier
-- `urgency` (int) — `1`=low, `2`=medium, `3`=critical
-- `distance` (float) — Distance from rescue base in km (1.0–10.0)
-- `survival_time` (int) — Steps remaining before this victim dies if not rescued
-- `alive` (bool) — Whether the victim is still alive
-- `rescued` (bool) — Whether the victim has been rescued
-
-### Reward
-
-The reward function is dense — a shaped signal is returned every step:
-
-| Component | Value |
-|---|---|
-| Rescue urgency=3 (critical) | +0.85 |
-| Rescue urgency=2 (medium) | +0.60 |
-| Rescue urgency=1 (low) | +0.30 |
-| Criticality bonus (rescuing just-in-time) | up to +0.20 |
-| Efficiency bonus (closer victim) | small positive |
-| Skip penalty (allocate_to=-1) | −0.08 |
-| Invalid action penalty | −0.12 |
-| Death penalty — urgency=3 | −0.85 |
-| Death penalty — urgency=2 | −0.55 |
-| Death penalty — urgency=1 | −0.25 |
-| Pressure penalty (urgent victims at risk) | up to −0.18 |
-
-Final reward per step is clamped to `[0.0, 1.0]`.
-
-## Difficulty Levels
-
-### Easy
-- 4 victims, mostly low urgency
-- Survival times: 6–12 steps
-- Distances: 1–5 km
-- 12 max steps, time decay: 1/step
-
-### Medium
-- 5 victims, balanced urgency distribution
-- Survival times: 4–9 steps
-- Distances: 1–8 km
-- 10 max steps, time decay: 1/step
-
-### Hard
-- 7 victims, mostly critical urgency
-- Survival times: 2–6 steps
-- Distances: 1–10 km
-- 8 max steps, time decay: 2/step (survival drops faster)
-
-## Advanced Usage
-
-### Connecting to an Existing Server
+The agent sends a rescue unit to a disaster zone each step.
 
 ```python
-from disaster_env import DisasterAction, DisasterEnv
-
-# Connect to a deployed HF Space or local server
-env = DisasterEnv(base_url="https://YOUR-USERNAME-disaster-env.hf.space")
-
-result = env.reset(difficulty="hard", seed=999)
-obs = result.observation
-
-result = env.step(DisasterAction(allocate_to=0))
-print(f"Reward: {result.reward}")
-
-env.close()
-```
-
-### Using the Context Manager
-
-```python
-from disaster_env import DisasterAction, DisasterEnv
-
-with DisasterEnv(base_url="http://localhost:8000") as env:
-    result = env.reset(difficulty="easy", seed=42)
-    obs = result.observation
-
-    while not result.done:
-        # Greedy: rescue highest urgency alive victim
-        alive = [v for v in obs.victims if v.alive and not v.rescued]
-        if not alive:
-            break
-        target = max(alive, key=lambda v: (v.urgency, -v.survival_time))
-        result = env.step(DisasterAction(allocate_to=target.id))
-        obs = result.observation
-        print(f"Step {obs.time_step} — reward: {result.reward:.2f}")
-```
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py — use factory mode for concurrent sessions
-app = create_app(
-    DisasterEnvironment,   # Pass class, not instance
-    DisasterAction,
-    DisasterObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
+DisasterAction(
+    zone_id:   int,   # Zone to send the unit to (0-indexed)
+    unit_type: str,   # "ambulance" | "rescue_team" | "helicopter"
 )
 ```
 
-## Running the Inference Script
+| Unit Type | Victims Rescued / Step | Available In |
+|-----------|----------------------|--------------|
+| `ambulance` | 2 | easy, medium, hard |
+| `rescue_team` | 3 | easy, medium, hard |
+| `helicopter` | 5 | easy, medium only |
+
+Victims are rescued in priority order: highest urgency first, then lowest survival time.
+
+---
+
+## Observation Space
+
+Each step returns a `DisasterObservation` with the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `time_step` | int | Current step number (0-indexed) |
+| `max_steps` | int | Total step budget for this episode |
+| `difficulty` | str | `"easy"` \| `"medium"` \| `"hard"` |
+| `resources_available` | int | Total rescue units available this step |
+| `episode_done` | bool | Whether the episode has terminated |
+| `zones` | list[dict] | All disaster zones — see schema below |
+| `victims` | list[VictimState] | Flat list of all victims across all zones |
+| `last_action_info` | dict \| None | Per-step info; includes `grade_report` on terminal step |
+
+**Zone dict schema:**
+
+```json
+{
+  "zone_id":       0,
+  "name":          "Kedarnath Temple Area",
+  "district":      "Rudraprayag",
+  "disaster_type": "flash_flood",
+  "severity":      0.85,
+  "people":        8,
+  "rescued":       3,
+  "time_waiting":  2,
+  "is_active":     true,
+  "victims": [
+    {
+      "id":            0,
+      "urgency":       3,
+      "survival_time": 4,
+      "distance":      2.5,
+      "alive":         true,
+      "rescued":       false
+    }
+  ]
+}
+```
+
+**VictimState schema:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | int | Unique victim identifier |
+| `urgency` | int | 1 = low, 2 = medium, 3 = critical |
+| `survival_time` | int | Steps remaining before victim dies if not rescued |
+| `distance` | float | Distance from rescue base in km (1.0–10.0) |
+| `alive` | bool | Whether the victim is still alive |
+| `rescued` | bool | Whether the victim has been rescued |
+
+---
+
+## Tasks
+
+### Task 1 — Easy: Single-Zone Flash Flood (`seed=42`)
+
+**Location:** Kedarnath Temple Area, Rudraprayag  
+**Zones:** 1 | **Victims:** 7 | **Step budget:** 30 | **Success threshold:** 0.5
+
+Single-zone flood scenario. No disaster spread. No victim spawning. Helicopters available. Ideal for learning basic triage prioritisation.
+
+**Objective:** Rescue maximum civilians before the step budget runs out.
+
+---
+
+### Task 2 — Medium: Three-Zone Multi-Disaster (`seed=123`)
+
+**Locations:** Kedarnath (flash flood) · Badrinath (landslide) · Rishikesh (river overflow)  
+**Zones:** 3 | **Victims:** 8 per zone (24 total) | **Step budget:** 40 | **Success threshold:** 0.6
+
+Disaster spreads to adjacent zones every 5 steps, raising severity. The agent must balance immediate rescues against worsening conditions in other zones. Helicopters available.
+
+**Objective:** Coordinate rescue across 3 zones with spreading disaster.
+
+---
+
+### Task 3 — Hard: Five-Zone Crisis Under Pressure (`seed=999`)
+
+**Locations:** Kedarnath · Joshimath · Dehradun · Haridwar · Chamoli  
+**Zones:** 5 | **Victims:** 8 per zone (40 initial) | **Step budget:** 25 | **Success threshold:** 0.7
+
+Kedarnath starts at maximum severity (1.0). Disaster spreads every 2 steps. New victims spawn every 5 steps. **No helicopters available** — only ambulances and rescue teams. The agent must triage aggressively under severe time and resource pressure.
+
+**Objective:** Manage 5 zones under extreme resource constraints and time pressure.
+
+---
+
+## Reward Function
+
+### Per-step reward (non-sparse signal)
+
+| Action | Reward |
+|--------|--------|
+| Rescue in high-severity zone (≥ 0.7) | +1.0 |
+| Rescue in medium-severity zone (≥ 0.4) | +0.5 |
+| Rescue in low-severity zone (< 0.4) | +0.2 |
+| Wasted action (zone fully rescued) | −0.1 |
+| Invalid action (bad zone_id or unit_type) | −0.3 |
+
+### Terminal reward (episode score)
+
+On the final step, the reward is replaced by a normalised episode score in [0.0, 1.0]:
+
+```
+score = base_rescue_score − time_penalty − wait_penalty − spawn_penalty
+```
+
+- `base_rescue_score` — weighted fraction of victims rescued per severity bucket
+- `time_penalty` — penalises consuming more of the step budget
+- `wait_penalty` — penalises leaving victims waiting in active zones
+- `spawn_penalty` — penalises failing to rescue spawned victims (hard mode only)
+
+The `grade_report` dict is included in `last_action_info` on the terminal step.
+
+---
+
+## Baseline Scores
+
+Scores produced by the greedy fallback policy (highest-severity zone, most powerful unit):
+
+| Task | Difficulty | Score | Passed |
+|------|------------|-------|--------|
+| task1_easy_rescue | easy | ~0.62 | Yes |
+| task2_medium_rescue | medium | ~0.55 | No |
+| task3_hard_rescue | hard | ~0.38 | No |
+
+LLM-guided policy (Qwen2.5-72B-Instruct) typically achieves higher scores by considering victim urgency and survival time alongside zone severity.
+
+---
+
+## Setup & Usage
+
+### Requirements
+
+- Python 3.10+
+- Docker
+- Hugging Face account + token
+
+### Install dependencies
 
 ```bash
-# Set environment variables
-export API_BASE_URL=https://router.huggingface.co/v1
-export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-export HF_TOKEN=hf_xxxxxxxxxxxx
-export ENV_URL=https://YOUR-USERNAME-disaster-env.hf.space
+pip install -r requirements.txt
+```
 
-# Run
+### Run the server locally
+
+```bash
+python server.py
+# Server starts at http://localhost:8000
+```
+
+### Run inference locally
+
+```bash
+export HF_TOKEN="your_hf_token"
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+export ENV_URL="http://localhost:8000"
+
 python inference.py
 ```
 
-Expected stdout format:
-```
-[START] task=task1_nearest_first env=disaster_env model=Qwen/Qwen2.5-72B-Instruct
-[STEP] step=1 action=allocate_to=2 reward=0.85 done=false error=null
-[STEP] step=2 action=allocate_to=0 reward=0.62 done=false error=null
-...
-[END] success=true steps=7 score=0.743 rewards=0.85,0.62,...
-```
-
-## Development & Testing
-
-### Run Tests
+### Run with Docker
 
 ```bash
-# From the server directory
-cd server
-python -m pytest tests/ -v
+docker build -t disaster-env .
+docker run -p 8000:8000 disaster-env
 ```
 
-Test coverage includes:
-- Grid world mechanics (zone count, severity ranges, spread, spawning)
-- Grader scoring (rescue score, time penalty, wait penalty)
-- Task configuration (easy/medium/hard)
-- Constants validation (zones, resources, step limits)
-- Generator reproducibility (same seed → same scenario)
+### Environment variables
 
-### Test the Environment Directly
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HF_TOKEN` | Yes | Hugging Face API key |
+| `API_BASE_URL` | Yes | LLM API endpoint |
+| `MODEL_NAME` | Yes | Model identifier for inference |
+| `ENV_URL` | Yes | URL of the deployed environment server |
+| `PORT` | No | Server port (default: 8000) |
 
-```bash
-# Test core environment logic without the HTTP server
-python3 server/disaster_env_environment.py
-```
+---
 
-### Run the Server Locally
+## API Endpoints
 
-```bash
-uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/reset` | Start a new episode `{"difficulty": "easy\|medium\|hard", "seed": int}` |
+| `POST` | `/step` | Execute one action `{"zone_id": int, "unit_type": str}` |
+| `GET` | `/state` | Get current episode state |
+| `DELETE` | `/session` | Clean up a session (send `X-Session-ID` header) |
+
+Each request should include an `X-Session-ID` header to isolate concurrent sessions.
+
+---
 
 ## Project Structure
 
 ```
-disaster_env/
-├── __init__.py                          # Module exports
-├── README.md                            # This file
-├── openenv.yaml                         # OpenEnv manifest
-├── pyproject.toml                       # Project metadata and dependencies
-├── inference.py                         # Baseline LLM inference script
-├── client.py                            # DisasterEnv client
-├── models.py                            # Action and Observation models
-└── server/
-    ├── __init__.py                      # Server module exports
-    ├── app.py                           # FastAPI application (HTTP + WebSocket)
-    ├── disaster_env_environment.py      # Core RL environment logic
-    ├── constants.py                     # Shared zone/difficulty configuration
-    ├── generators.py                    # Scenario factory (civilians + resources)
-    ├── grid.py                          # Multi-zone GridWorld simulation
-    ├── grader.py                        # Episode scoring (0.0–1.0)
-    ├── tasks.py                         # Task definitions (easy/medium/hard)
-    ├── requirements.txt                 # Server dependencies
-    └── tests/
-        ├── test_constants.py
-        ├── test_generators.py
-        ├── test_grader.py
-        ├── test_grid.py
-        └── test_tasks.py
+.
+├── server.py                      # FastAPI server — /reset, /step, /state endpoints
+├── inference.py                   # LLM agent loop — runs all 3 tasks
+├── disaster_env_environment.py    # DisasterEnvironment — OpenEnv wrapper
+├── models.py                      # Pydantic data models (Action, Observation)
+├── grid.py                        # GridWorld simulation engine
+├── grader.py                      # Scoring and reward computation
+├── generators.py                  # Victim and scenario generation
+├── tasks.py                       # Task configurations (easy/medium/hard)
+├── constants.py                   # Shared constants (zones, limits, weights)
+├── openenv.yaml                   # OpenEnv spec metadata
+├── Dockerfile                     # Container definition
+└── requirements.txt               # Python dependencies
 ```
+
+---
+
+## OpenEnv Spec Compliance
+
+- `reset()` returns a clean `DisasterObservation` with full initial state
+- `step(action)` returns observation, reward, done flag, and info dict
+- `state()` returns current episode state at any point
+- All models are typed Pydantic classes inheriting from OpenEnv base types
+- `openenv.yaml` defines name, version, entrypoint, and endpoints
+- Scores are deterministic and reproducible via fixed seeds
+
+---
+
+## Infra
+
+- Runtime: inference script completes all 3 tasks in under 20 minutes
+- Machine requirements: vcpu=2, memory=8gb compatible
+- No GPU required
