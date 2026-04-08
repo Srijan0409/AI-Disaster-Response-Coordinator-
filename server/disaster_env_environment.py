@@ -202,7 +202,6 @@ class DisasterEnvironment(Environment):
 
     # ── State ─────────────────────────────────────────────────────────────────
 
-    @property
     def state(self) -> State:
         """OpenEnv State — episode_id and step_count."""
         return self._state
