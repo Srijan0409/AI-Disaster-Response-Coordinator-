@@ -1,4 +1,5 @@
-from tasks import get_task
+import copy
+from disaster_env.server.tasks import get_task
 
 # =============================================================================
 # GRADER — AI Disaster Response Coordinator
@@ -7,7 +8,7 @@ from tasks import get_task
 #
 # Score = base_rescue_score - time_penalty - wait_penalty - spawn_penalty
 #
-# calculate_step_reward / calculate_waiting_penalty
+# calculate_step_reward
 #     Called inside env.step() after every action — non-sparse per-step signal.
 #
 # Dashboard rules satisfied:
@@ -53,18 +54,8 @@ REWARD_WEIGHTS = {
 # ---------------------------------------------------------------------------
 # Severity thresholds
 # ---------------------------------------------------------------------------
-HIGH_SEVERITY_THRESHOLD  = 0.7
-MED_SEVERITY_THRESHOLD   = 0.4
-
-# ---------------------------------------------------------------------------
-# Per-step reward constants
-# ---------------------------------------------------------------------------
-HIGH_SEVERITY_REWARD     =  1.0
-MEDIUM_SEVERITY_REWARD   =  0.5
-LOW_SEVERITY_REWARD      =  0.2
-WASTED_STEP_PENALTY      = -0.1
-INVALID_ACTION_PENALTY   = -0.3
-WAITING_PENALTY_PER_STEP =  0.02
+HIGH_SEVERITY_THRESHOLD = 0.7
+MED_SEVERITY_THRESHOLD  = 0.4
 
 
 def _bucket(severity):
@@ -77,69 +68,39 @@ def _bucket(severity):
 
 
 # ---------------------------------------------------------------------------
-# Per-step functions — Person A calls these inside env.step()
+# Per-step function — called inside env.step() after every action
 # ---------------------------------------------------------------------------
 
 def calculate_step_reward(zone_id, zones, action_valid):
     """
     Calculates the immediate reward for a single action at each step.
-    Called inside env.step() after every action — non-sparse per-step signal.
 
     High severity rescue   → +1.0
     Medium severity rescue → +0.5
     Low severity rescue    → +0.2
     Wasted step            → -0.1  (zone already fully rescued)
-    Invalid action         → -0.3  (zone does not exist)
-
-    Args:
-        zone_id      : the zone the agent sent a resource to
-        zones        : current list of zone dicts
-        action_valid : whether the action was a valid choice
-
-    Returns:
-        Float reward value
+    Invalid action         → -0.3  (zone does not exist or bad unit_type)
     """
     if not action_valid:
-        return INVALID_ACTION_PENALTY
+        return -0.3
 
     target = next((z for z in zones if z["zone_id"] == zone_id), None)
     if target is None:
-        return INVALID_ACTION_PENALTY
+        return -0.3
 
     if not target["is_active"]:
-        return WASTED_STEP_PENALTY
+        return -0.1
 
     if target["severity"] >= HIGH_SEVERITY_THRESHOLD:
-        return HIGH_SEVERITY_REWARD
+        return 1.0
     elif target["severity"] >= MED_SEVERITY_THRESHOLD:
-        return MEDIUM_SEVERITY_REWARD
+        return 0.5
     else:
-        return LOW_SEVERITY_REWARD
-
-
-def calculate_waiting_penalty(zones):
-    """
-    Calculates the total waiting penalty for all unrescued high-severity zones.
-    Called inside env.step() after every tick.
-
-    Penalises the agent for letting critical victims wait too long.
-    Encourages the agent to act quickly on high-severity zones.
-
-    Args:
-        zones: current list of zone dicts
-
-    Returns:
-        Float penalty value (always negative or zero)
-    """
-    penalty = 0.0
-    for zone in zones:
-        if zone["is_active"] and zone["severity"] >= HIGH_SEVERITY_THRESHOLD:
-            penalty -= zone["time_waiting"] * WAITING_PENALTY_PER_STEP
-    return penalty
+        return 0.2
 
 
 # ---------------------------------------------------------------------------
-# Episode-end functions — Person A calls these when done=True
+# Episode-end functions — called when done=True
 # ---------------------------------------------------------------------------
 
 def compute_rescue_score(zones_initial, zones_final, weights):
@@ -147,9 +108,16 @@ def compute_rescue_score(zones_initial, zones_final, weights):
     Base rescue score — fraction of each severity bucket rescued,
     weighted by importance.
 
-    Uses zones_initial severity so the agent is scored on what it faced
-    at the start. Rescued count is capped at initial people count so
-    spawned victims do not inflate this score.
+    Uses victim counts from zones_initial so spawned victims don't
+    inflate the score. Victim-aware: counts rescued victims per zone.
+
+    FIX: Counts v["rescued"] == True directly instead of using alive=False
+         as a proxy.
+
+    DESIGN FIX: victims list presence check uses `is not None` instead of
+         truthiness — an empty list `[]` is falsy but is a valid (empty)
+         victims list and should trigger the fallback branch correctly.
+         Changed to explicit `is not None and len(...) > 0` guard.
 
     Args:
         zones_initial : zone dicts at episode start, from reset()
@@ -160,52 +128,51 @@ def compute_rescue_score(zones_initial, zones_final, weights):
         Float in [0.0, 1.0]
     """
     init_map = {z["zone_id"]: z for z in zones_initial}
-    totals   = {"high": 0, "med": 0, "low": 0}
-    rescued  = {"high": 0, "med": 0, "low": 0}
+    totals  = {"high": 0, "med": 0, "low": 0}
+    rescued = {"high": 0, "med": 0, "low": 0}
 
     for z in zones_initial:
-        totals[_bucket(z["severity"])] += z["people"]
+        bucket = _bucket(z["severity"])
+        victims = z.get("victims")
+        # DESIGN FIX: explicit check — empty list [] is falsy but valid
+        if victims is not None and len(victims) > 0:
+            totals[bucket] += len(victims)
+        else:
+            totals[bucket] += z.get("people", 0)
 
     for z in zones_final:
         zid    = z["zone_id"]
         bucket = _bucket(init_map[zid]["severity"])
-        rescued[bucket] += min(z["rescued"], init_map[zid]["people"])
+        initial_victims = init_map[zid].get("victims")
+        final_victims   = z.get("victims", [])
 
-    def bucket_score(key, weight):
-        if totals[key] == 0:
+        # DESIGN FIX: same explicit check for initial_victims
+        if initial_victims is not None and len(initial_victims) > 0:
+            initial_ids      = {v["id"] for v in initial_victims}
+            # FIX: check v["rescued"] directly — do not rely on alive=False
+            rescued[bucket] += sum(
+                1 for v in final_victims
+                if v["rescued"] and v["id"] in initial_ids
+            )
+        else:
+            # fallback: use zone-level rescued count
+            rescued[bucket] += min(
+                z.get("rescued", 0),
+                init_map[zid].get("people", 0)
+            )
+
+    def bucket_score(k):
+        if totals[k] == 0:
             return 0.0
-        return weight * (rescued[key] / totals[key])
+        return weights[f"{k}_severity_weight"] * (rescued[k] / totals[k])
 
-    raw = (
-        bucket_score("high", weights["high_severity_weight"]) +
-        bucket_score("med",  weights["med_severity_weight"])  +
-        bucket_score("low",  weights["low_severity_weight"])
-    )
-
-    max_possible = sum(
-        weights[f"{k}_severity_weight"]
-        for k in ["high", "med", "low"]
-        if totals[k] > 0
-    )
-
-    if max_possible == 0:
-        return 0.0
-
-    return raw / max_possible
+    return bucket_score("high") + bucket_score("med") + bucket_score("low")
 
 
 def compute_time_penalty(steps_taken, max_steps, weight):
     """
     Penalises the agent for consuming more of the step budget.
     Formula: weight * (steps_taken / max_steps)
-
-    Args:
-        steps_taken : steps the agent used this episode
-        max_steps   : total step budget (from tasks.py)
-        weight      : time_penalty_weight for this difficulty
-
-    Returns:
-        Float >= 0.0
     """
     if steps_taken <= 1:
         return 0.0
@@ -216,13 +183,6 @@ def compute_wait_penalty(zones_final, weight):
     """
     Penalises leaving victims waiting in still-active zones.
     Uses average time_waiting across zones with unrescued people.
-
-    Args:
-        zones_final : zone dicts at episode end
-        weight      : wait_penalty_weight for this difficulty
-
-    Returns:
-        Float >= 0.0
     """
     active = [z for z in zones_final if z["is_active"]]
     if not active:
@@ -235,14 +195,6 @@ def compute_spawn_penalty(spawned_victims, rescued_spawned, weight):
     """
     Penalises failing to rescue victims that spawned mid-episode.
     Only relevant in hard mode. Returns 0.0 if no victims spawned.
-
-    Args:
-        spawned_victims : total new victims that appeared mid-episode
-        rescued_spawned : how many of those spawned victims were rescued
-        weight          : spawn_penalty_weight for this difficulty
-
-    Returns:
-        Float >= 0.0
     """
     if spawned_victims == 0:
         return 0.0
@@ -262,17 +214,6 @@ def compute_reward(
     Called inside env.step() when done=True. Returns float in [0.0, 1.0].
 
     Score = base_rescue_score - time_penalty - wait_penalty - spawn_penalty
-
-    Args:
-        task_level      : 'easy', 'medium', or 'hard'
-        zones_initial   : zone dicts from reset()
-        zones_final     : zone dicts from last step()
-        steps_taken     : how many steps the agent used
-        spawned_victims : total new victims mid-episode (hard only, default 0)
-        rescued_spawned : how many spawned victims rescued (hard only, default 0)
-
-    Returns:
-        Float in [0.0, 1.0]
     """
     task    = get_task(task_level)
     weights = REWARD_WEIGHTS[task_level]
@@ -294,20 +235,30 @@ def grade_episode(
     rescued_spawned=0,
 ):
     """
-    Returns a full grading report for one episode.
+    Returns a full grading report for one completed episode.
     inference.py logs this dict in the [END] block.
 
-    Args:
-        task_level      : 'easy', 'medium', or 'hard'
-        zones_initial   : zone dicts from reset()
-        zones_final     : zone dicts from last step()
-        steps_taken     : steps used this episode
-        spawned_victims : total new victims mid-episode (hard only)
-        rescued_spawned : spawned victims rescued (hard only)
+    BUG 15 FIX: stats["total_rescued"] previously counted ALL rescued victims
+    including spawned ones, while stats["total_people"] only counted initial
+    victims from zones_initial. This caused total_rescued > total_people in
+    hard mode (misleading and confusing for dashboards/callers).
 
-    Returns:
-        Dict with keys: task_level, score, passed, success_threshold,
-                        breakdown, stats
+    Fix: total_rescued now only counts rescued victims whose IDs appear in
+    zones_initial (same logic as compute_rescue_score) — spawned victims are
+    excluded from both totals to keep them consistent.
+    The spawned rescue stats are separately reported as spawned_victims /
+    rescued_spawned in the stats dict for full visibility.
+
+    BUG 20 FIX: initial_victims_exist previously only checked zones_initial[0].
+    If zone 0 had no victims (e.g. empty zone in a custom scenario) but other
+    zones did, the check would return False and fall back to the zone-level
+    rescued/people fields for ALL zones — silently under-counting rescued victims
+    in zones 1..N that do have individual victim dicts.
+    Fix: check whether ANY zone in zones_initial has a non-empty victims list.
+    This is consistent with how compute_rescue_score() handles the same decision
+    per-zone (already correct there), but grade_episode() needs a single branch
+    decision for the stats block — we use the most permissive check: if any zone
+    has victims, use the victim-ID path globally.
     """
     task    = get_task(task_level)
     weights = REWARD_WEIGHTS[task_level]
@@ -317,9 +268,42 @@ def grade_episode(
     w_pen = compute_wait_penalty(zones_final, weights["wait_penalty_weight"])
     s_pen = compute_spawn_penalty(spawned_victims, rescued_spawned, weights["spawn_penalty_weight"])
 
-    final_score   = round(max(0.0, min(1.0, base - t_pen - w_pen - s_pen)), 4)
-    total_people  = sum(z["people"]  for z in zones_initial)
-    total_rescued = sum(z["rescued"] for z in zones_final)
+    final_score = round(max(0.0, min(1.0, base - t_pen - w_pen - s_pen)), 4)
+
+    # BUG 20 FIX: check whether ANY zone has a non-empty victims list, not just
+    # zones_initial[0]. A zone-0-empty scenario would incorrectly fall through to
+    # the zone-level fallback for all zones, missing per-victim data in zones 1..N.
+    # Old code:
+    #   initial_victims_exist = (
+    #       zones_initial
+    #       and zones_initial[0].get("victims") is not None
+    #       and len(zones_initial[0].get("victims", [])) > 0
+    #   )
+    initial_victims_exist = any(
+        z.get("victims") is not None and len(z.get("victims", [])) > 0
+        for z in zones_initial
+    )
+
+    if initial_victims_exist:
+        # Build set of all initial victim IDs across all zones
+        initial_id_map = {
+            z["zone_id"]: {v["id"] for v in z.get("victims", [])}
+            for z in zones_initial
+        }
+        total_people = sum(
+            len(ids) for ids in initial_id_map.values()
+        )
+        # BUG 15 FIX: only count rescued victims whose IDs existed at episode start
+        final_zone_map = {z["zone_id"]: z for z in zones_final}
+        total_rescued = sum(
+            1
+            for zid, initial_ids in initial_id_map.items()
+            for v in final_zone_map.get(zid, {}).get("victims", [])
+            if v["rescued"] and v["id"] in initial_ids
+        )
+    else:
+        total_people  = sum(z.get("people", 0)  for z in zones_initial)
+        total_rescued = sum(z.get("rescued", 0) for z in zones_final)
 
     return {
         "task_level":        task_level,

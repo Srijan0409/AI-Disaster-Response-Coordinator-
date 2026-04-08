@@ -7,102 +7,99 @@
 """
 AI Disaster Response Coordinator — Environment Implementation.
 
-A reinforcement learning environment that simulates emergency triage:
-  - Victims have urgency (1-3), distance (km), and survival_time (steps)
-  - The agent allocates limited rescue teams each step
-  - Victims die if not rescued in time, triggering death penalties
-  - Three difficulty levels (easy / medium / hard) control scenario parameters
+Wraps the GridWorld simulation (grid.py) inside the OpenEnv Environment
+interface so it can be served over HTTP/WebSocket and evaluated by the
+hackathon harness.
+
+BUG 9 FIX: _build_observation previously collapsed the full resource dict
+    into a single integer (rescue_teams + ambulances), discarding helicopter
+    availability. Fixed to expose the full RESOURCE_CONFIG dict so the agent
+    and inference script can make unit-type decisions correctly.
+
+BUG 10 / 11 FIX: The environment was calling grade_episode() again after
+    grid.step() had already computed and returned the final score via
+    compute_reward(). This caused two problems:
+      a) Duplicate computation with a potentially different zones_final
+         (the grid had already advanced past tick()).
+      b) The environment's grade_episode() call used self._grid._zones_initial
+         which is the grid's own snapshot — consistent, but the env also
+         maintained _zones_initial independently, creating two separate sources.
+    Fix: trust grid.step()'s returned reward when done=True (it already IS
+    the normalised final score from compute_reward()). Read grade metadata
+    from result["info"]["episode_reward"]. Call grade_episode() only once —
+    here in the environment — using the grid's own _zones_initial so the
+    snapshot is guaranteed consistent with what grid.step() used.
 """
 
-import random
+import copy
 from typing import Any
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
-try:
-    from ..models import DisasterAction, DisasterObservation, VictimState
-except ImportError:
-    from models import DisasterAction, DisasterObservation, VictimState
+from disaster_env.models import DisasterAction, DisasterObservation, VictimState
+from disaster_env.server.grid import GridWorld
+from disaster_env.server.tasks import get_task
+from disaster_env.server.grader import grade_episode
+from disaster_env.server.constants import RESOURCE_CONFIG, STEP_LIMITS
 
 
-# --- Difficulty configuration ------------------------------------------------
-
-DIFFICULTY_CONFIG: dict[str, dict] = {
-    "easy": {
-        "num_victims": 4,
-        "num_resources": 2,
-        "max_steps": 12,
-        "survival_time_range": (6, 12),
-        "urgency_weights": [0.5, 0.3, 0.2],
-        "distance_range": (1.0, 5.0),
-        "time_decay": 1,
-    },
-    "medium": {
-        "num_victims": 5,
-        "num_resources": 2,
-        "max_steps": 10,
-        "survival_time_range": (4, 9),
-        "urgency_weights": [0.3, 0.4, 0.3],
-        "distance_range": (1.0, 8.0),
-        "time_decay": 1,
-    },
-    "hard": {
-        "num_victims": 7,
-        "num_resources": 2,
-        "max_steps": 8,
-        "survival_time_range": (2, 6),
-        "urgency_weights": [0.2, 0.3, 0.5],
-        "distance_range": (1.0, 10.0),
-        "time_decay": 2,
-    },
-}
-
-URGENCY_REWARD = {1: 0.30, 2: 0.60, 3: 0.85}
-URGENCY_DEATH_PENALTY = {1: 0.25, 2: 0.55, 3: 0.85}
-SKIP_PENALTY = 0.08
-INVALID_ACTION_PENALTY = 0.12
+def _zone_victims_to_victim_states(victims_dicts: list[dict]) -> list[VictimState]:
+    """Convert victim dicts (from GridWorld) to VictimState objects."""
+    return [
+        VictimState(
+            id=v["id"],
+            urgency=v["urgency"],
+            # BUG 8 FIX: grid stores "distance_km", VictimState field is "distance"
+            distance=v["distance_km"],
+            survival_time=v["survival_time"],
+            alive=v["alive"],
+            rescued=v["rescued"],
+        )
+        for v in victims_dicts
+    ]
 
 
 class DisasterEnvironment(Environment):
     """
-    AI Disaster Response Coordinator environment.
+    AI Disaster Response Coordinator — OpenEnv-compatible environment.
 
-    The agent must decide which victim to rescue each step, given:
-      - Victims with different urgency levels (1=low, 2=medium, 3=critical)
-      - Distances from the rescue base (affects rescue cost)
-      - Survival times that count down every step
-      - A fixed number of rescue teams per step
+    Wraps the full GridWorld simulation (grid.py) inside the OpenEnv
+    Environment interface.
 
-    Supports three difficulty levels:
-      easy   - 4 victims, forgiving survival times, short distances
-      medium - 5 victims, balanced scenario
-      hard   - 7 victims, critical urgency dominates, fast time decay
+    Difficulty levels
+    -----------------
+    easy   — 1 zone  (Kedarnath flash flood)
+               7 victims, ambulances + rescue_team + helicopter,
+               30 step budget, no spread, no spawn
+    medium — 3 zones (Kedarnath, Badrinath, Rishikesh)
+               8 victims/zone, disaster spreads every 5 steps, 40 steps
+    hard   — 5 zones (Kedarnath, Joshimath, Dehradun, Haridwar, Chamoli)
+               8 victims/zone, spreads every 2 steps, victims spawn
+               every 5 steps, NO helicopters, 25 step budget
 
-    Episode ends when:
-      - All victims are rescued or dead, OR
-      - max_steps is reached
+    Action
+    ------
+    DisasterAction(zone_id=<int>, unit_type=<"ambulance"|"rescue_team"|"helicopter">)
+
+    Observation
+    -----------
+    DisasterObservation — full zone + victim state, full resources dict, step info.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self):
-        """Initialise with a default medium-difficulty scenario."""
+    def __init__(self) -> None:
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._difficulty: str = "medium"
-        self._config: dict = DIFFICULTY_CONFIG["medium"]
-        self._rng: random.Random = random.Random()
-
-        self._victims: list[VictimState] = []
-        self._time_step: int = 0
-        self._resources_available: int = 2
+        self._seed: int = 42
+        self._grid: GridWorld | None = None
+        self._task: dict = {}
         self._done: bool = False
         self._episode_reward: float = 0.0
-        self._rescued_ids: set[int] = set()
-        self._dead_ids: set[int] = set()
 
-    # --- Reset ----------------------------------------------------------------
+    # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(
         self,
@@ -110,216 +107,157 @@ class DisasterEnvironment(Environment):
         seed: int | None = None,
     ) -> DisasterObservation:
         """
-        Generate a new random disaster scenario.
+        Start a new episode.
 
         Args:
-            difficulty: "easy" | "medium" | "hard"
-            seed:       Optional int for reproducible scenarios
+            difficulty: "easy" | "medium" | "hard"  (default: "medium")
+            seed:       Optional int — uses the task's canonical seed when
+                        None, ensuring reproducible evaluation scores.
 
         Returns:
-            DisasterObservation with the initial scenario state
+            DisasterObservation with the initial scenario state.
         """
-        if difficulty not in DIFFICULTY_CONFIG:
+        valid = ("easy", "medium", "hard")
+        if difficulty not in valid:
             raise ValueError(
-                f"difficulty must be one of {list(DIFFICULTY_CONFIG.keys())}, got '{difficulty}'"
+                f"difficulty must be one of {list(valid)}, got '{difficulty}'"
             )
 
         self._difficulty = difficulty
-        self._config = DIFFICULTY_CONFIG[difficulty]
-        self._rng = random.Random(seed)
+        self._task = get_task(difficulty)
+        self._seed = seed if seed is not None else self._task["seed"]
+
+        self._grid = GridWorld(difficulty, self._seed)
+        self._grid.reset()
 
         self._state = State(episode_id=str(uuid4()), step_count=0)
-        self._time_step = 0
-        self._resources_available = self._config["num_resources"]
         self._done = False
         self._episode_reward = 0.0
-        self._rescued_ids = set()
-        self._dead_ids = set()
 
-        cfg = self._config
-        st_min, st_max = cfg["survival_time_range"]
-        d_min, d_max = cfg["distance_range"]
+        return self._build_observation(reward=0.0, info=None)
 
-        self._victims = []
-        for i in range(cfg["num_victims"]):
-            urgency = self._rng.choices([1, 2, 3], weights=cfg["urgency_weights"])[0]
-            distance = round(self._rng.uniform(d_min, d_max), 2)
-            survival_time = self._rng.randint(st_min, st_max)
-            self._victims.append(
-                VictimState(
-                    id=i,
-                    urgency=urgency,
-                    distance=distance,
-                    survival_time=survival_time,
-                )
-            )
-
-        return self._make_observation(reward=0.0, info=None)
-
-    # --- Step -----------------------------------------------------------------
+    # ── Step ──────────────────────────────────────────────────────────────────
 
     def step(self, action: DisasterAction) -> DisasterObservation:  # type: ignore[override]
         """
-        Execute one rescue allocation step.
+        Execute one rescue action.
 
         Args:
-            action: DisasterAction with allocate_to = victim id (or -1 to skip)
+            action: DisasterAction(zone_id=<int>, unit_type=<str>)
 
         Returns:
-            DisasterObservation with updated state, reward, done flag
+            DisasterObservation — updated state, per-step reward, done flag.
+            When done=True, reward IS the final normalised score [0.0, 1.0]
+            and last_action_info contains the full grade_report.
 
         Raises:
-            RuntimeError: if called after episode has ended
+            RuntimeError: if called after the episode has already ended.
         """
-        if self._done:
-            raise RuntimeError("Episode has ended. Call reset() to start a new one.")
+        if self._done or self._grid is None:
+            raise RuntimeError(
+                "Episode has ended. Call reset() to start a new episode."
+            )
 
         self._state.step_count += 1
-        raw_reward = 0.0
-        info: dict[str, Any] = {
-            "rescued": False,
-            "died": [],
-            "invalid": False,
-            "skipped": False,
-            "reward_components": {
-                "rescue_value": 0.0,
-                "criticality_bonus": 0.0,
-                "efficiency_bonus": 0.0,
-                "pressure_penalty": 0.0,
-                "deaths_penalty": 0.0,
-                "action_penalty": 0.0,
-            },
+
+        grid_action = {
+            "zone_id":   action.zone_id,
+            "unit_type": action.unit_type,
         }
 
-        victim_id = action.allocate_to
+        # grid.step() handles: apply_action → calculate_step_reward → tick →
+        # compute_reward (when done). When done=True, result["reward"] is
+        # already the final normalised score — do NOT call grade_episode again.
+        result = self._grid.step(grid_action)
 
-        # --- Validate and execute allocation ----------------------------------
-        if victim_id == -1:
-            raw_reward -= SKIP_PENALTY
-            info["skipped"] = True
-            info["reward_components"]["action_penalty"] = SKIP_PENALTY
+        reward: float = result["reward"]
+        done: bool    = result["done"]
 
-        elif self._resources_available <= 0:
-            raw_reward -= INVALID_ACTION_PENALTY
-            info["invalid"] = True
-            info["reason"] = "no_resources"
-            info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
+        info: dict[str, Any] = {
+            "action_valid":  result["info"]["action_valid"],
+            "rescued_count": result["info"]["rescued_count"],
+            "episode_reward": result["info"]["episode_reward"],
+        }
 
-        else:
-            target = self._find_victim(victim_id)
+        self._episode_reward = result["info"]["episode_reward"]
+        self._done = done
 
-            if target is None:
-                raw_reward -= INVALID_ACTION_PENALTY
-                info["invalid"] = True
-                info["reason"] = "victim_not_found"
-                info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
+        # BUG 10/11 FIX: grid.step() already ran compute_reward() when done=True
+        # and returned the final normalised score as result["reward"].
+        # We call grade_episode() once here for the full breakdown dict (score,
+        # passed, breakdown, stats) — using the grid's own _zones_initial so
+        # the snapshot is guaranteed identical to what compute_reward() used.
+        if done:
+            grade_report = grade_episode(
+                task_level      = self._difficulty,
+                zones_initial   = self._grid._zones_initial,
+                zones_final     = self._grid.get_state()["zones"],
+                steps_taken     = self._grid.step_num,
+                spawned_victims = self._grid._spawned_victims,
+                rescued_spawned = self._grid._rescued_spawned,
+            )
+            info["grade_report"] = grade_report
 
-            elif not target.alive or target.rescued:
-                raw_reward -= INVALID_ACTION_PENALTY
-                info["invalid"] = True
-                info["reason"] = "victim_unavailable"
-                info["reward_components"]["action_penalty"] = INVALID_ACTION_PENALTY
+        return self._build_observation(reward=round(reward, 4), info=info)
 
-            else:
-                # --- Successful rescue ----------------------------------------
-                target.rescued = True
-                target.alive = False
-                self._resources_available -= 1
-                self._rescued_ids.add(victim_id)
-
-                urgency_reward = URGENCY_REWARD[target.urgency]
-                criticality_bonus = max(0.0, (4 - min(target.survival_time, 4)) * 0.05)
-                efficiency_bonus = max(0.0, (10.0 - target.distance) / 100.0)
-
-                raw_reward += urgency_reward + criticality_bonus + efficiency_bonus
-                info["reward_components"]["rescue_value"] = round(urgency_reward, 4)
-                info["reward_components"]["criticality_bonus"] = round(criticality_bonus, 4)
-                info["reward_components"]["efficiency_bonus"] = round(efficiency_bonus, 4)
-
-                info["rescued"] = True
-                info["rescued_id"] = victim_id
-                info["urgency"] = target.urgency
-
-        # --- Advance time: decay survival_time of all living victims ----------
-        self._time_step += 1
-        self._resources_available = self._config["num_resources"]  # reset each step
-        decay = self._config["time_decay"]
-
-        died_this_step: list[int] = []
-        for v in self._victims:
-            if not v.alive or v.rescued:
-                continue
-            v.survival_time -= decay
-            if v.survival_time <= 0:
-                v.alive = False
-                self._dead_ids.add(v.id)
-                died_this_step.append(v.id)
-                raw_reward -= URGENCY_DEATH_PENALTY[v.urgency]
-                info["reward_components"]["deaths_penalty"] = round(
-                    info["reward_components"]["deaths_penalty"] + URGENCY_DEATH_PENALTY[v.urgency],
-                    4,
-                )
-
-        info["died"] = died_this_step
-        living = [v for v in self._victims if v.alive and not v.rescued]
-
-        if living:
-            at_risk = [
-                v for v in living
-                if (v.urgency >= 2 and v.survival_time <= 2) or (v.urgency == 3 and v.survival_time <= 3)
-            ]
-            pressure_penalty = min(0.18, 0.04 * len(at_risk))
-            raw_reward -= pressure_penalty
-            info["reward_components"]["pressure_penalty"] = round(pressure_penalty, 4)
-
-        # --- Check episode termination ----------------------------------------
-        if self._time_step >= self._config["max_steps"] or not living:
-            self._done = True
-
-        reward = max(0.0, min(1.0, raw_reward))
-        info["raw_reward"] = round(raw_reward, 4)
-        self._episode_reward += reward
-        return self._make_observation(reward=round(reward, 4), info=info)
-
-    # --- State ----------------------------------------------------------------
+    # ── State ─────────────────────────────────────────────────────────────────
 
     @property
     def state(self) -> State:
-        """Current OpenEnv State with episode_id and step_count."""
+        """OpenEnv State — episode_id and step_count."""
         return self._state
 
-    # --- Internal helpers -----------------------------------------------------
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _make_observation(
+    def _build_observation(
         self,
         reward: float,
         info: dict | None,
     ) -> DisasterObservation:
-        """Build a DisasterObservation from current episode state."""
+        """Construct a DisasterObservation from the current GridWorld state."""
+        if self._grid is None:
+            return DisasterObservation(
+                time_step=0,
+                resources_available=0,
+                resources={},
+                max_steps=0,
+                difficulty=self._difficulty,
+                zones=[],
+                victims=[],
+                episode_done=False,
+                last_action_info=info,
+            )
+
+        grid_state = self._grid.get_state()
+        zones_raw  = grid_state["zones"]
+
+        # Flat victim list across all zones (VictimState objects)
+        all_victims: list[VictimState] = []
+        for z in zones_raw:
+            all_victims.extend(_zone_victims_to_victim_states(z["victims"]))
+
+        # BUG 9 FIX: expose the full resource dict, not a collapsed integer.
+        # Old code: resources_available = resources.get("rescue_teams") + resources.get("ambulances")
+        # This discarded helicopter count and gave the agent no way to know
+        # what units were actually available.
+        resource_config = RESOURCE_CONFIG[self._difficulty]
+        resources_available = sum(resource_config.values())
+
         return DisasterObservation(
-            time_step=self._time_step,
-            resources_available=self._resources_available,
-            max_steps=self._config["max_steps"],
-            difficulty=self._difficulty,
-            victims=list(self._victims),
-            episode_done=self._done,
-            last_action_info=info,
+            time_step            = grid_state["step_num"],
+            resources_available  = resources_available,
+            resources            = dict(resource_config),
+            max_steps            = STEP_LIMITS[self._difficulty],
+            difficulty           = self._difficulty,
+            zones                = zones_raw,    # already deepcopied by Zone.to_dict()
+            victims              = all_victims,
+            episode_done         = self._done,
+            last_action_info     = info,
+            done                 = self._done,
+            reward               = reward,
+            metadata             = {
+                "episode_reward": self._episode_reward,
+                "step":          grid_state["step_num"],
+                "difficulty":    self._difficulty,
+            },
         )
-
-    def _find_victim(self, victim_id: int) -> VictimState | None:
-        for v in self._victims:
-            if v.id == victim_id:
-                return v
-        return None
-
-    def _episode_summary(self) -> dict:
-        total = len(self._victims)
-        return {
-            "total_victims": total,
-            "rescued": len(self._rescued_ids),
-            "dead": len(self._dead_ids),
-            "still_alive": total - len(self._rescued_ids) - len(self._dead_ids),
-            "episode_reward": round(self._episode_reward, 4),
-            "steps_taken": self._time_step,
-            "difficulty": self._difficulty,
-        }
