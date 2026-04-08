@@ -201,8 +201,10 @@ pip install -r requirements.txt
 ### Run the server locally
 
 ```bash
-python server.py
+uvicorn server.app:app --host 0.0.0.0 --port 8000
 # Server starts at http://localhost:8000
+```
+
 ```
 
 ### Run inference locally
@@ -248,22 +250,39 @@ Each request should include an `X-Session-ID` header to isolate concurrent sessi
 
 ---
 
+## Demo Output
+
+Example run of the inference script:
+
+```
+[START] task=task1_easy_rescue env=disaster_env model=Qwen
+[STEP] step=1 action=zone_id=0 unit_type=rescue_team reward=1.00 done=false error=null
+[STEP] step=2 action=zone_id=0 unit_type=ambulance reward=0.50 done=false error=null
+[END] success=true steps=10 score=0.65 rewards=1.00,0.50,...
+```
+
+
 ## Project Structure
 
 ```
 .
-├── server.py                      # FastAPI server — /reset, /step, /state endpoints
-├── inference.py                   # LLM agent loop — runs all 3 tasks
-├── disaster_env_environment.py    # DisasterEnvironment — OpenEnv wrapper
-├── models.py                      # Pydantic data models (Action, Observation)
-├── grid.py                        # GridWorld simulation engine
-├── grader.py                      # Scoring and reward computation
-├── generators.py                  # Victim and scenario generation
-├── tasks.py                       # Task configurations (easy/medium/hard)
-├── constants.py                   # Shared constants (zones, limits, weights)
-├── openenv.yaml                   # OpenEnv spec metadata
-├── Dockerfile                     # Container definition
-└── requirements.txt               # Python dependencies
+├── server/
+│   └── app.py                  # FastAPI server (OpenEnv create_app)
+├── disaster_env/
+│   ├── server/
+│   │   ├── disaster_env_environment.py
+│   │   ├── grid.py
+│   │   ├── grader.py
+│   │   ├── generators.py
+│   │   ├── tasks.py
+│   │   └── constants.py
+│   └── models.py
+├── inference.py
+├── openenv.yaml
+├── Dockerfile
+└── requirements.txt
+```
+
 ```
 
 ---
