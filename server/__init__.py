@@ -4,8 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Disaster Env environment server components."""
+"""Disaster Env Environment."""
 
-from .disaster_env_environment import DisasterEnvironment
+from disaster_env.client import DisasterEnv
+from disaster_env.models import DisasterAction, DisasterObservation
 
-__all__ = ["DisasterEnvironment"]
+__all__ = [
+    "DisasterAction",
+    "DisasterObservation",
+    "DisasterEnv",
+]

@@ -1,5 +1,6 @@
-from constants import UTTARAKHAND_ZONES, STEP_LIMITS, RESOURCE_CONFIG
-from generators import generate_scenario
+import copy
+from disaster_env.server.constants import UTTARAKHAND_ZONES, STEP_LIMITS, RESOURCE_CONFIG
+from disaster_env.server.generators import generate_scenario
 
 TASKS = {
     "easy": {
@@ -57,14 +58,34 @@ TASKS = {
     },
 }
 
+
 def get_task(task_level):
+    """
+    Returns the task configuration for the given difficulty level.
+
+    BUG 14 FIX: previously returned TASKS[task_level] directly — a live
+    reference to the shared mutable dict. Any caller mutating the returned
+    dict (e.g., task["resources"]["ambulances"] = 0) would permanently
+    corrupt the TASKS registry for all subsequent calls in the same process.
+    This is a classic mutable-default / shared-state bug.
+
+    Fix: return a deep copy so every caller gets an independent snapshot.
+    deepcopy is used (not shallow copy) because nested dicts like
+    "resources", "observation_space", and "action_space" would still be
+    shared references with a shallow copy.
+    """
     if task_level not in TASKS:
-        raise ValueError(f"Unknown task level: {task_level!r}. Choose from: {list(TASKS.keys())}")
-    return TASKS[task_level]
+        raise ValueError(
+            f"Unknown task level: {task_level!r}. "
+            f"Choose from: {list(TASKS.keys())}"
+        )
+    return copy.deepcopy(TASKS[task_level])
+
 
 def get_task_scenario(task_level):
     config = get_task(task_level)
     return generate_scenario(task_level, config["seed"])
+
 
 def list_tasks():
     return list(TASKS.keys())

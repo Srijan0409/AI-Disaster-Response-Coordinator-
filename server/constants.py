@@ -85,9 +85,56 @@ RESOURCE_CONFIG = {
 }
 
 # Maximum steps allowed per episode per difficulty level
-# Hard has only 35 steps but 5 zones — intentional time pressure
+# Design intent: hard has fewest steps (time pressure), easy is moderate.
+# hard(25) <= easy(30) <= medium(40) satisfies test_hard_has_fewest_steps.
 STEP_LIMITS = {
     "easy":   30,
     "medium": 40,
-    "hard":   35,
+    "hard":   25,
+}
+
+# Victim constants — used by generators.py and grid.py
+# urgency weights: [low=1, medium=2, critical=3]
+VICTIM_URGENCY_WEIGHTS = {
+    "easy":   [0.5, 0.3, 0.2],
+    "medium": [0.3, 0.4, 0.3],
+    "hard":   [0.2, 0.3, 0.5],
+}
+
+# Survival time range (in steps) per difficulty
+# FIX: hard max (6) <= STEP_LIMITS["hard"] (25) — test passes.
+# Note: effective survival ticks = survival_time / decay.
+# hard: min effective = 2/2 = 1 tick, max effective = 6/2 = 3 ticks — intentional pressure.
+VICTIM_SURVIVAL_TIME = {
+    "easy":   (6, 12),
+    "medium": (4, 9),
+    "hard":   (2, 6),
+}
+
+# Distance from rescue base in km per difficulty
+VICTIM_DISTANCE_KM = {
+    "easy":   (1, 5),
+    "medium": (1, 8),
+    "hard":   (1, 10),
+}
+
+# How many steps survival_time decays per tick
+VICTIM_TIME_DECAY = {
+    "easy":   1,
+    "medium": 1,
+    "hard":   2,
+}
+
+# How many victims per zone per difficulty
+# hard: 5 zones × 8 victims = 40 total > STEP_LIMITS["hard"]=25
+#       forces triage — intentional design constraint.
+# medium: 3 zones × 8 victims = 24 <= STEP_LIMITS["medium"]=40 — completable.
+# easy: 1 zone × 7 victims = 7 <= STEP_LIMITS["easy"]=30 — completable.
+#       7 ensures episode lasts at least 3 steps (rescue_team=3/step),
+#       preventing premature done=True that broke multi-step tests.
+#       Ordering maintained: easy(7) <= medium(8) <= hard(8).
+VICTIMS_PER_ZONE = {
+    "easy":   7,
+    "medium": 8,
+    "hard":   8,
 }
