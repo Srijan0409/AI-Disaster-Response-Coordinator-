@@ -223,8 +223,12 @@ def compute_reward(
     w_pen = compute_wait_penalty(zones_final, weights["wait_penalty_weight"])
     s_pen = compute_spawn_penalty(spawned_victims, rescued_spawned, weights["spawn_penalty_weight"])
 
-    return round(max(0.0, min(1.0, base - t_pen - w_pen - s_pen)), 4)
+    score = base - t_pen - w_pen - s_pen
 
+    epsilon = 1e-6
+    score = max(epsilon, min(1 - epsilon, score))
+
+    return round(score, 4)
 
 def grade_episode(
     task_level,
@@ -268,8 +272,12 @@ def grade_episode(
     w_pen = compute_wait_penalty(zones_final, weights["wait_penalty_weight"])
     s_pen = compute_spawn_penalty(spawned_victims, rescued_spawned, weights["spawn_penalty_weight"])
 
-    final_score = round(max(0.0, min(1.0, base - t_pen - w_pen - s_pen)), 4)
+    score = base - t_pen - w_pen - s_pen
 
+    epsilon = 1e-6
+    score = max(epsilon, min(1 - epsilon, score))
+
+    final_score = round(score, 4)
     # BUG 20 FIX: check whether ANY zone has a non-empty victims list, not just
     # zones_initial[0]. A zone-0-empty scenario would incorrectly fall through to
     # the zone-level fallback for all zones, missing per-victim data in zones 1..N.
