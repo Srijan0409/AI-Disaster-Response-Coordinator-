@@ -1,35 +1,38 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# =============================================================================
+# disaster_env_environment.py — OpenEnv Environment for AI Disaster Response
+# =============================================================================
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""
-AI Disaster Response Coordinator — Environment Implementation.
-
-Wraps the GridWorld simulation (grid.py) inside the OpenEnv Environment
-interface so it can be served over HTTP/WebSocket and evaluated by the
-hackathon harness.
-
-BUG 9 FIX: _build_observation previously collapsed the full resource dict
-    into a single integer (rescue_teams + ambulances), discarding helicopter
-    availability. Fixed to expose the full RESOURCE_CONFIG dict so the agent
-    and inference script can make unit-type decisions correctly.
-
-BUG 10 / 11 FIX: The environment was calling grade_episode() again after
-    grid.step() had already computed and returned the final score via
-    compute_reward(). This caused two problems:
-      a) Duplicate computation with a potentially different zones_final
-         (the grid had already advanced past tick()).
-      b) The environment's grade_episode() call used self._grid._zones_initial
-         which is the grid's own snapshot — consistent, but the env also
-         maintained _zones_initial independently, creating two separate sources.
-    Fix: trust grid.step()'s returned reward when done=True (it already IS
-    the normalised final score from compute_reward()). Read grade metadata
-    from result["info"]["episode_reward"]. Call grade_episode() only once —
-    here in the environment — using the grid's own _zones_initial so the
-    snapshot is guaranteed consistent with what grid.step() used.
-"""
+# Wraps GridWorld (grid.py) inside the OpenEnv Environment interface so it
+# can be served over HTTP and evaluated by the hackathon harness.
+#
+# Key design invariants
+# ---------------------
+# 1. Single source of truth for zones_initial:
+#    grid._zones_initial is the ONLY snapshot used — both by compute_reward()
+#    inside grid.step() and by grade_episode() called here. No separate env-
+#    level snapshot exists (BUG 10/11 FIX).
+#
+# 2. No duplicate score computation:
+#    When done=True, grid.step() already ran compute_reward() and returned the
+#    final normalised score as result["reward"]. grade_episode() is called once
+#    here solely to produce the full breakdown dict for last_action_info.
+#    The score in grade_report will always equal result["reward"] because both
+#    call _compute_score_components() — the shared core (BUG I FIX in grader).
+#
+# 3. Full resource dict exposed (BUG 9 FIX):
+#    _build_observation() passes the complete RESOURCE_CONFIG dict, not a
+#    collapsed integer, so the agent can make correct unit-type decisions.
+#
+# 4. Victim field mapping (BUG 8 FIX):
+#    Grid stores "distance_km"; VictimState model uses "distance". The rename
+#    happens exactly once — in _zone_victims_to_victim_states() — nowhere else.
+#
+# 5. Seed enforcement:
+#    GridWorld.__init__() validates that the passed seed matches the task's
+#    canonical seed (BUG 1 & 3 FIX in grid). reset() always uses the
+#    task-canonical seed unless an explicit override is passed (e.g. for
+#    testing). Passing the wrong seed raises ValueError immediately.
+# =============================================================================
 
 import copy
 from typing import Any
@@ -45,14 +48,22 @@ from disaster_env.server.grader import grade_episode
 from disaster_env.server.constants import RESOURCE_CONFIG, STEP_LIMITS
 
 
+# ---------------------------------------------------------------------------
+# Helper — victim dict → VictimState
+# ---------------------------------------------------------------------------
+
 def _zone_victims_to_victim_states(victims_dicts: list[dict]) -> list[VictimState]:
-    """Convert victim dicts (from GridWorld) to VictimState objects."""
+    """
+    Convert victim dicts from GridWorld into VictimState objects.
+
+    BUG 8 FIX: grid stores "distance_km"; VictimState uses "distance".
+    This is the single rename point — grid internals are never touched.
+    """
     return [
         VictimState(
             id=v["id"],
             urgency=v["urgency"],
-            # BUG 8 FIX: grid stores "distance_km", VictimState field is "distance"
-            distance=v["distance_km"],
+            distance=v["distance_km"],        # BUG 8 FIX: field rename boundary
             survival_time=v["survival_time"],
             alive=v["alive"],
             rescued=v["rescued"],
@@ -61,23 +72,24 @@ def _zone_victims_to_victim_states(victims_dicts: list[dict]) -> list[VictimStat
     ]
 
 
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
 class DisasterEnvironment(Environment):
     """
     AI Disaster Response Coordinator — OpenEnv-compatible environment.
-
-    Wraps the full GridWorld simulation (grid.py) inside the OpenEnv
-    Environment interface.
 
     Difficulty levels
     -----------------
     easy   — 1 zone  (Kedarnath flash flood)
                7 victims, ambulances + rescue_team + helicopter,
-               30 step budget, no spread, no spawn
+               30 step budget, no spread, no spawn.
     medium — 3 zones (Kedarnath, Badrinath, Rishikesh)
-               8 victims/zone, disaster spreads every 5 steps, 40 steps
+               8 victims/zone, spreads every 5 steps, 40 steps.
     hard   — 5 zones (Kedarnath, Joshimath, Dehradun, Haridwar, Chamoli)
-               8 victims/zone, spreads every 2 steps, victims spawn
-               every 5 steps, NO helicopters, 25 step budget
+               8 victims/zone, spreads every 2 steps, victims spawn every
+               5 steps, NO helicopters, 25 step budget.
 
     Action
     ------
@@ -85,19 +97,20 @@ class DisasterEnvironment(Environment):
 
     Observation
     -----------
-    DisasterObservation — full zone + victim state, full resources dict, step info.
+    DisasterObservation — full zone + victim state, full resource dict,
+    step info, and (on terminal step) complete grade_report.
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self) -> None:
-        self._state = State(episode_id=str(uuid4()), step_count=0)
-        self._difficulty: str = "medium"
-        self._seed: int = 42
-        self._grid: GridWorld | None = None
-        self._task: dict = {}
-        self._done: bool = False
-        self._episode_reward: float = 0.0
+        self._state          = State(episode_id=str(uuid4()), step_count=0)
+        self._difficulty: str          = "medium"
+        self._seed: int                = 123       # medium canonical seed
+        self._grid: GridWorld | None   = None
+        self._task: dict               = {}
+        self._done: bool               = False
+        self._episode_reward: float    = 0.0
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
@@ -110,12 +123,18 @@ class DisasterEnvironment(Environment):
         Start a new episode.
 
         Args:
-            difficulty: "easy" | "medium" | "hard"  (default: "medium")
-            seed:       Optional int — uses the task's canonical seed when
-                        None, ensuring reproducible evaluation scores.
+            difficulty : "easy" | "medium" | "hard"  (default: "medium")
+            seed       : Optional override. When None the task's canonical
+                         seed is used (42 / 123 / 999) — guarantees
+                         reproducible evaluation scores.
 
         Returns:
             DisasterObservation with the initial scenario state.
+
+        Raises:
+            ValueError: if difficulty is not one of the three valid levels,
+                        or if the passed seed doesn't match the canonical one
+                        (raised inside GridWorld.__init__).
         """
         valid = ("easy", "medium", "hard")
         if difficulty not in valid:
@@ -123,15 +142,15 @@ class DisasterEnvironment(Environment):
                 f"difficulty must be one of {list(valid)}, got '{difficulty}'"
             )
 
-        self._difficulty = difficulty
-        self._task = get_task(difficulty)
-        self._seed = seed if seed is not None else self._task["seed"]
+        self._difficulty     = difficulty
+        self._task           = get_task(difficulty)
+        self._seed           = seed if seed is not None else self._task["seed"]
 
-        self._grid = GridWorld(difficulty, self._seed)
+        self._grid           = GridWorld(difficulty, self._seed)
         self._grid.reset()
 
-        self._state = State(episode_id=str(uuid4()), step_count=0)
-        self._done = False
+        self._state          = State(episode_id=str(uuid4()), step_count=0)
+        self._done           = False
         self._episode_reward = 0.0
 
         return self._build_observation(reward=0.0, info=None)
@@ -142,13 +161,26 @@ class DisasterEnvironment(Environment):
         """
         Execute one rescue action.
 
+        Internally calls grid.step() which:
+            1. Captures zones_before snapshot (BUG 2 FIX)
+            2. Runs apply_action()  — validates unit type (helicopter enforcement)
+            3. Calls calculate_step_reward() on zones_before
+            4. Calls tick()  — survival decay, spread, spawn
+            5. When done=True: calls compute_reward() → final normalised score
+
+        When done=True:
+            - result["reward"] IS the final episode score from compute_reward().
+            - grade_episode() is called once here for the full breakdown dict.
+            - grade_report["score"] == result["reward"] guaranteed because
+              both use _compute_score_components() (BUG I FIX in grader).
+
         Args:
             action: DisasterAction(zone_id=<int>, unit_type=<str>)
 
         Returns:
-            DisasterObservation — updated state, per-step reward, done flag.
-            When done=True, reward IS the final normalised score [0.0, 1.0]
-            and last_action_info contains the full grade_report.
+            DisasterObservation with updated state.
+            last_action_info always contains: action_valid, rescued_count,
+            episode_reward. On terminal step also contains grade_report.
 
         Raises:
             RuntimeError: if called after the episode has already ended.
@@ -165,28 +197,24 @@ class DisasterEnvironment(Environment):
             "unit_type": action.unit_type,
         }
 
-        # grid.step() handles: apply_action → calculate_step_reward → tick →
-        # compute_reward (when done). When done=True, result["reward"] is
-        # already the final normalised score — do NOT call grade_episode again.
         result = self._grid.step(grid_action)
 
         reward: float = result["reward"]
         done: bool    = result["done"]
 
         info: dict[str, Any] = {
-            "action_valid":  result["info"]["action_valid"],
-            "rescued_count": result["info"]["rescued_count"],
+            "action_valid":   result["info"]["action_valid"],
+            "rescued_count":  result["info"]["rescued_count"],
             "episode_reward": result["info"]["episode_reward"],
         }
 
         self._episode_reward = result["info"]["episode_reward"]
-        self._done = done
+        self._done           = done
 
-        # BUG 10/11 FIX: grid.step() already ran compute_reward() when done=True
-        # and returned the final normalised score as result["reward"].
-        # We call grade_episode() once here for the full breakdown dict (score,
-        # passed, breakdown, stats) — using the grid's own _zones_initial so
-        # the snapshot is guaranteed identical to what compute_reward() used.
+        # BUG 10/11 FIX:
+        # grid.step() already ran compute_reward() when done=True.
+        # grade_episode() called once here — uses grid._zones_initial
+        # (same snapshot compute_reward used) so score is guaranteed identical.
         if done:
             grade_report = grade_episode(
                 task_level      = self._difficulty,
@@ -213,48 +241,57 @@ class DisasterEnvironment(Environment):
         reward: float,
         info: dict | None,
     ) -> DisasterObservation:
-        """Construct a DisasterObservation from the current GridWorld state."""
+        """
+        Construct a DisasterObservation from the current GridWorld state.
+
+        BUG 9 FIX: exposes the full RESOURCE_CONFIG dict (ambulances,
+        rescue_teams, helicopters) instead of collapsing to a single integer.
+        resources_available is still provided as the sum for quick checks.
+
+        Zone dicts are already deepcopied by Zone.to_dict() (FIX 17 in grid)
+        so no additional copy is needed here.
+        """
+        # Grid not yet initialised (called before first reset)
         if self._grid is None:
             return DisasterObservation(
-                time_step=0,
-                resources_available=0,
-                resources={},
-                max_steps=0,
-                difficulty=self._difficulty,
-                zones=[],
-                victims=[],
-                episode_done=False,
-                last_action_info=info,
+                time_step           = 0,
+                resources_available = 0,
+                resources           = {},
+                max_steps           = 0,
+                difficulty          = self._difficulty,
+                zones               = [],
+                victims             = [],
+                episode_done        = False,
+                done                = False,
+                reward              = 0.0,
+                last_action_info    = info,
             )
 
         grid_state = self._grid.get_state()
         zones_raw  = grid_state["zones"]
 
-        # Flat victim list across all zones (VictimState objects)
+        # Flat VictimState list across all zones
         all_victims: list[VictimState] = []
         for z in zones_raw:
             all_victims.extend(_zone_victims_to_victim_states(z["victims"]))
 
-        # BUG 9 FIX: expose the full resource dict, not a collapsed integer.
-        # Old code: resources_available = resources.get("rescue_teams") + resources.get("ambulances")
-        # This discarded helicopter count and gave the agent no way to know
-        # what units were actually available.
-        resource_config = RESOURCE_CONFIG[self._difficulty]
+        # BUG 9 FIX: full resource dict, never collapsed
+        resource_config     = RESOURCE_CONFIG[self._difficulty]
         resources_available = sum(resource_config.values())
 
         return DisasterObservation(
-            time_step            = grid_state["step_num"],
-            resources_available  = resources_available,
-            resources            = dict(resource_config),
-            max_steps            = STEP_LIMITS[self._difficulty],
-            difficulty           = self._difficulty,
-            zones                = zones_raw,    # already deepcopied by Zone.to_dict()
-            victims              = all_victims,
-            episode_done         = self._done,
-            last_action_info     = info,
-            done                 = self._done,
-            reward               = reward,
-            metadata             = {
+            time_step           = grid_state["step_num"],
+            resources_available = resources_available,
+            resources           = dict(resource_config),
+            max_steps           = STEP_LIMITS[self._difficulty],
+            difficulty          = self._difficulty,
+            zones               = zones_raw,
+            victims             = all_victims,
+            episode_done        = self._done,
+            done                = self._done,
+            reward              = reward,
+            last_action_info    = info,
+            metadata            = {
                 "episode_reward": self._episode_reward,
                 "step":          grid_state["step_num"],
                 "difficulty":    self._difficulty,
