@@ -357,7 +357,7 @@ async def run_task(task_name: str, difficulty: str, seed: int, client: OpenAI) -
     """
     rewards: List[float] = []
     steps_taken = 0
-    score       = 0.0
+    score       = 0.05   # FIX: 0.0 is out-of-range for validator; use SCORE_MIN
     success     = False
 
     log_start(task_name, BENCHMARK, MODEL_NAME)
@@ -403,7 +403,10 @@ async def run_task(task_name: str, difficulty: str, seed: int, client: OpenAI) -
                     success = grade_report.get("passed", score >= SUCCESS_SCORE_THRESHOLD)
                 else:
                     # Fallback: should not occur in normal flow
-                    score   = min(sum(rewards) / max(len(rewards), 1), 1.0)
+                    # FIX: clamp strictly to (0, 1) open interval — validator
+                    # rejects exactly 0.0 and 1.0
+                    raw     = sum(rewards) / max(len(rewards), 1)
+                    score   = max(1e-4, min(raw, 1 - 1e-4))
                     success = score >= SUCCESS_SCORE_THRESHOLD
 
                 break
