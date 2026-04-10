@@ -138,3 +138,13 @@ VICTIMS_PER_ZONE = {
     "medium": 8,
     "hard":   8,
 }
+
+# Unit types allowed per difficulty level.
+# Hard mode excludes helicopters — enforced at runtime in apply_action().
+# FIX (helicopter enforcement): previously only documented in task description;
+# apply_action() accepted helicopters silently. Now validated against this map.
+ALLOWED_UNIT_TYPES = {
+    "easy":   {"ambulance", "rescue_team", "helicopter"},
+    "medium": {"ambulance", "rescue_team", "helicopter"},
+    "hard":   {"ambulance", "rescue_team"},
+}

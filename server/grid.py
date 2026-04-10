@@ -4,6 +4,7 @@ from disaster_env.server.constants import (
     UTTARAKHAND_ZONES, SEVERITY_RANGES, PEOPLE_RANGES,
     VICTIM_TIME_DECAY, VICTIM_URGENCY_WEIGHTS,
     VICTIM_SURVIVAL_TIME, VICTIM_DISTANCE_KM,
+    ALLOWED_UNIT_TYPES,                          # FIX: helicopter enforcement
 )
 from disaster_env.server.generators import _generate_victims
 from disaster_env.server.tasks import get_task
@@ -21,6 +22,22 @@ class Zone:
         self.rescued       = 0
         self.time_waiting  = 0
 
+    @property
+    def is_active(self):
+        """
+        FIX (is_active fragility): previously computed as people > rescued.
+        That relied on zone.people staying perfectly in sync with
+        len(zone.victims), which is a fragile contract — any code path that
+        mutates victims without updating people would silently break scoring.
+
+        Fix: derive is_active directly from the victims list — the single
+        source of truth. A zone is active if at least one victim is still
+        alive AND not yet rescued.
+
+        This also makes is_active immune to future zone.people drift.
+        """
+        return any(v["alive"] and not v["rescued"] for v in self.victims)
+
     def to_dict(self):
         return {
             "zone_id":       self.zone_id,
@@ -31,7 +48,7 @@ class Zone:
             "people":        self.people,
             "rescued":       self.rescued,
             "time_waiting":  self.time_waiting,
-            "is_active":     self.people > self.rescued,
+            "is_active":     self.is_active,         # FIX: property, not field
             "victims":       copy.deepcopy(self.victims),
         }
 
@@ -71,10 +88,55 @@ class GridWorld:
             established in reset() (zone.people = len(zone.victims)). A mismatch
             between zone.people and len(zone.victims) would cause incorrect
             is_active, rescued-ratio, and scoring calculations downstream.
+
+    BUG 2 FIX (zones_before snapshot):
+        step() now captures zones_before BEFORE apply_action() is called.
+        Previously zones_now was captured after apply_action(), so for the
+        last victim in a zone is_active was already False — causing a spurious
+        -0.1 "wasted step" penalty instead of the correct positive reward.
+
+    BUG 1 & 3 FIX (seed enforcement):
+        __init__() validates that the passed seed matches the task's canonical
+        seed. A mismatch raises ValueError immediately so callers can't
+        accidentally run a non-reproducible episode.
+
+    BUG F FIX (time_waiting double-increment):
+        spread_threat() previously unconditionally did time_waiting += 1 on
+        the receiving zone. tick() already increments time_waiting for every
+        active zone. Zones that were already active got double-incremented,
+        inflating wait_penalty and lowering the final score incorrectly.
+        Fixed: spread_threat() only increments time_waiting when the zone was
+        NOT already active AND had at least one victim (i.e. it was just
+        activated by the spread). Zero-victim zones must never get
+        time_waiting incremented — they are logically inactive regardless
+        of rescued count.
+
+    FIX (is_active property):
+        Zone.is_active is now a @property derived from the victims list.
+        The old field `people > rescued` was a fragile computed value that
+        could diverge from reality if any code path mutated victims without
+        updating zone.people. The property reads directly from the source
+        of truth and is always consistent.
+
+    FIX (helicopter enforcement):
+        apply_action() now checks unit_type against
+        ALLOWED_UNIT_TYPES[task_level]. Hard mode does not allow helicopters.
+        Previously the task description said "no helicopters" but apply_action()
+        silently accepted them, letting agents cheat in hard mode.
     """
 
     def __init__(self, task_level, seed):
         self.task_level = task_level
+
+        # BUG 1 & 3 FIX: validate seed against task's canonical seed.
+        task = get_task(task_level)
+        if seed != task["seed"]:
+            raise ValueError(
+                f"Seed mismatch for task '{task_level}': "
+                f"passed {seed!r}, expected {task['seed']!r}. "
+                f"Use GridWorld(task_level='{task_level}', seed={task['seed']})."
+            )
+
         self.seed       = seed
         self.zones      = []
         self.step_num   = 0
@@ -162,9 +224,6 @@ class GridWorld:
                 spawn_penalty calculation.
         FIX 19: zone.people derived from len(zone.victims) after appending
                 new victims — maintains single source of truth contract.
-                Previously zone.people was manually incremented by new_count
-                which could diverge from the actual victim list length if any
-                exception or early return occurred mid-loop.
         """
         # FIX 7: only spawn into zones that still have alive unrescued victims
         active_zones = [
@@ -199,8 +258,6 @@ class GridWorld:
 
         self._spawned_victims += new_count
         # FIX 19: derive people from len(victims) — single source of truth.
-        # Old code: target_zone.people += new_count
-        # Risk: manual increment diverges from victim list if loop exits early.
         target_zone.people = len(target_zone.victims)
 
     def tick(self, spread=False, spread_interval=5, spawn_victims=False):
@@ -217,7 +274,8 @@ class GridWorld:
         decay = VICTIM_TIME_DECAY[self.task_level]
 
         for zone in self.zones:
-            if zone.people > zone.rescued:
+            # Use is_active property — victim-based, always accurate.
+            if zone.is_active:
                 zone.time_waiting += 1
 
             for v in zone.victims:
@@ -237,14 +295,40 @@ class GridWorld:
         Simulates disaster spreading to adjacent zones.
         If a zone has severity above 0.6, the next zone's severity
         increases by 0.1 (capped at 1.0).
+
+        BUG F FIX (time_waiting double-increment):
+            Previously time_waiting was unconditionally incremented here for
+            the receiving zone. But tick() already increments time_waiting for
+            every zone where is_active=True. Any zone that was already active
+            got time_waiting incremented TWICE in the same step — once in tick()
+            and once here — artificially inflating wait_penalty and reducing the
+            final episode score.
+
+            Fix: only increment time_waiting in spread_threat() when the
+            receiving zone was NOT already active AND has at least one victim.
+            In that case tick() did NOT increment it, so spread_threat() must
+            do it to reflect that the zone just became active due to spreading.
+
+        FIX (zero-victim guard):
+            The original BUG F fix used `people <= rescued` which incorrectly
+            incremented time_waiting on zones with zero victims
+            (people=0, rescued=0 → 0<=0 is True). Such zones are logically
+            inert — they have no one to rescue and should never accumulate
+            time_waiting. Fixed by also checking that the zone has victims
+            before ever touching time_waiting in this function.
         """
         for i in range(len(self.zones) - 1):
             if self.zones[i].severity > 0.6:
-                self.zones[i + 1].severity = min(
-                    1.0,
-                    self.zones[i + 1].severity + 0.1
-                )
-                self.zones[i + 1].time_waiting += 1
+                receiving = self.zones[i + 1]
+                receiving.severity = min(1.0, receiving.severity + 0.1)
+
+                # FIX (zero-victim guard + BUG F FIX):
+                # Only touch time_waiting if the zone has victims AND was
+                # not already active (tick() handles active zones).
+                has_victims = len(receiving.victims) > 0
+                was_active  = receiving.is_active
+                if has_victims and not was_active:
+                    receiving.time_waiting += 1
 
     def apply_action(self, zone_id, unit_type):
         """
@@ -262,6 +346,15 @@ class GridWorld:
                 and alive=False were set, making rescued victims
                 indistinguishable from dead ones when iterating alive=False
                 victims downstream.
+
+        FIX (helicopter enforcement):
+                Validates unit_type against ALLOWED_UNIT_TYPES[task_level].
+                Hard mode does not allow helicopters. Previously the unit_type
+                check only verified membership in RESCUE_AMOUNTS (which
+                included helicopter). Agents could send helicopters in hard
+                mode and receive valid rescues — violating the task constraint
+                documented in tasks.py. Now returns (False, 0) for disallowed
+                unit types, matching the contract for invalid actions.
         """
         RESCUE_AMOUNTS = {
             "ambulance":   2,
@@ -270,6 +363,12 @@ class GridWorld:
         }
 
         zone = next((z for z in self.zones if z.zone_id == zone_id), None)
+
+        # FIX (helicopter enforcement): check against allowed types FIRST,
+        # before checking zone validity, so the return value is consistent
+        # (False, 0) regardless of which check fails.
+        if unit_type not in ALLOWED_UNIT_TYPES[self.task_level]:
+            return False, 0
 
         if zone is None or unit_type not in RESCUE_AMOUNTS:
             return False, 0
@@ -304,18 +403,11 @@ class GridWorld:
 
         Returns observation dict with current state, reward, done flag.
 
-        FIX 6: tasks and grader are imported at module level (top of file)
-                to avoid repeated import calls per step and stale-module risk.
+        FIX 6: tasks and grader are imported at module level.
         FIX 16: self._episode_reward is updated with the final compute_reward()
-                result when done=True, so info["episode_reward"] on the terminal
-                step always reflects the true final episode score — not just the
-                sum of intermediate step rewards which uses a different scale.
+                result when done=True.
         FIX 18: Per-step reward is NOT clamped to [0.0, 1.0].
-                calculate_step_reward() returns -0.3 for invalid actions and
-                -0.1 for wasted steps. The previous clamp (max(0.0, ...)) zeroed
-                these out, making bad actions appear the same as low-value actions
-                and removing the learning signal for the agent. Only the final
-                episode reward from compute_reward() is bounded to [0, 1].
+        BUG 2 FIX: zones_before captured BEFORE apply_action().
         """
         if self._done:
             raise RuntimeError(
@@ -323,24 +415,18 @@ class GridWorld:
                 "Call reset() to start a new episode."
             )
 
-        # FIX 6: use module-level imports (moved to top of step body —
-        # kept here as local names to preserve the lazy-import pattern
-        # that breaks the circular dependency, but imported only once
-        # per call stack frame — Python caches sys.modules so no overhead).
-        
-
         task = get_task(self.task_level)
 
         zone_id   = action.get("zone_id")
         unit_type = action.get("unit_type", "rescue_team")
 
-        action_valid, rescued_count = self.apply_action(zone_id, unit_type)
-        zones_now = [z.to_dict() for z in self.zones]
+        # BUG 2 FIX: capture snapshot BEFORE apply_action().
+        zones_before = [z.to_dict() for z in self.zones]
 
-        step_reward = calculate_step_reward(zone_id, zones_now, action_valid)
-        # FIX 18: do NOT clamp per-step reward — negative values (-0.3 invalid,
-        # -0.1 wasted) are meaningful signals that must reach the caller.
-        # Old code: reward = round(max(0.0, min(1.0, step_reward)), 4)
+        action_valid, rescued_count = self.apply_action(zone_id, unit_type)
+
+        step_reward = calculate_step_reward(zone_id, zones_before, action_valid)
+        # FIX 18: do NOT clamp per-step reward — negatives are meaningful signals.
         reward = round(step_reward, 4)
 
         self.tick(
@@ -353,8 +439,7 @@ class GridWorld:
 
         zones_after = [z.to_dict() for z in self.zones]
 
-        # FIX 5 consequence: all_done correctly checks rescued flag,
-        # not alive — a rescued victim has alive=True but rescued=True.
+        # FIX 5 consequence: all_done checks rescued flag, not alive.
         all_done = all(
             v["rescued"] or not v["alive"]
             for z in self.zones
@@ -372,11 +457,7 @@ class GridWorld:
                 self._spawned_victims,
                 self._rescued_spawned,
             )
-            # BUG 16 FIX: replace the accumulated step reward with the final
-            # episode score so info["episode_reward"] is meaningful on the
-            # terminal step. Without this, the last step's episode_reward was
-            # the sum of per-step rewards (different scale/meaning), while the
-            # returned reward was the normalised final score — inconsistent.
+            # FIX 16: replace accumulated step reward with final episode score.
             self._episode_reward = reward
 
         return {

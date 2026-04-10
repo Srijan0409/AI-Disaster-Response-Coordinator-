@@ -17,7 +17,10 @@ def _generate_victims(task_level, zone_index, seed_offset):
     Generates individual victims for a single zone.
 
     Each victim has:
-        id           : unique int within the zone (0-based, zone-local)
+        id           : globally unique int across ALL zones (not zone-local).
+                       Computed as zone_index * VICTIMS_PER_ZONE[task_level] + local_vid.
+                       This eliminates cross-zone ID collisions without requiring a
+                       mutable global counter here.
         urgency      : 1 (low), 2 (medium), 3 (critical)
         survival_time: steps before victim dies if not rescued
         distance_km  : distance from rescue base in km
@@ -28,9 +31,18 @@ def _generate_victims(task_level, zone_index, seed_offset):
     victim generation is fully reproducible and independent of any
     global random state.
 
+    FIX (global IDs): Previously IDs were zone-local (0, 1, 2 …).
+        Callers like grader.py that look up victims by ID across zones could
+        silently match the wrong victim if two zones both had id=0.
+        Fix: ID = zone_index * VICTIMS_PER_ZONE[task_level] + local_vid,
+        guaranteeing uniqueness across all zones for initial victims.
+        spawn_new_victims() in grid.py continues to use _next_victim_id
+        (a monotonically increasing counter) for spawned victims, which
+        are always > max initial ID, so no collision is possible.
+
     Args:
         task_level  : "easy", "medium", or "hard"
-        zone_index  : used to offset the seed so each zone gets different victims
+        zone_index  : used to offset the seed AND compute global IDs
         seed_offset : base seed value
 
     Returns:
@@ -42,10 +54,14 @@ def _generate_victims(task_level, zone_index, seed_offset):
     d_min, d_max   = VICTIM_DISTANCE_KM[task_level]
     weights        = VICTIM_URGENCY_WEIGHTS[task_level]
 
+    # Global ID base: ensures IDs are unique across all zones.
+    # zone 0 → IDs 0..count-1, zone 1 → IDs count..2*count-1, etc.
+    id_base = zone_index * count
+
     victims = []
-    for vid in range(count):
+    for local_vid in range(count):
         victims.append({
-            "id":            vid,
+            "id":            id_base + local_vid,   # FIX: globally unique ID
             "urgency":       rng.choices([1, 2, 3], weights=weights)[0],
             "survival_time": rng.randint(st_min, st_max),
             "distance_km":   round(rng.uniform(d_min, d_max), 2),
@@ -116,9 +132,8 @@ def generate_civilians(task_level, seed):
             # WARNING FIX: use isolated sev_rng instead of global random
             severity = round(sev_rng.uniform(sev_min, sev_max), 2)
 
-        # FIX: generate victims first, then derive people count from them
-        # Old code used random.randint(ppl_min, ppl_max) which diverged from
-        # grid.py where people = len(victims). This caused silent scoring bugs.
+        # FIX: generate victims first, then derive people count from them.
+        # _generate_victims now produces globally unique IDs (FIX above).
         victims = _generate_victims(task_level, i, seed)
 
         civilians.append({
@@ -127,7 +142,7 @@ def generate_civilians(task_level, seed):
             "district":      template["district"],
             "disaster_type": template["disaster_type"],
             "severity":      severity,
-            "people":        len(victims),   # ✅ derived from victims, not random
+            "people":        len(victims),   # derived from victims, not random
             "rescued":       0,
             "time_waiting":  0,
             "is_active":     True,
@@ -165,7 +180,7 @@ def sync_with_grid(civilians, grid):
     people (due to spawning), and rescued counts may have changed in
     grid.py. This keeps the civilians list fully in sync.
 
-    BUG 7 FIX: previously only updated severity, time_waiting, is_active.
+    # BUG 7 FIX: previously only updated severity, time_waiting, is_active.
     In hard mode, spawn_new_victims() increases zone.people and adds new
     victim dicts to zone.victims. Callers using civilians["people"] or
     civilians["rescued"] after a hard episode would read stale values —

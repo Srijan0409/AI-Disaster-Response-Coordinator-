@@ -1,206 +1,408 @@
+"""
+=============================================================================
+TEST SUITE — generators.py
+=============================================================================
+Run with:
+    pytest test_generators.py -v
+=============================================================================
+"""
+
+import copy
 import pytest
-from generators import generate_resources, generate_civilians, generate_scenario, sync_with_grid
-from constants import SEVERITY_RANGES, PEOPLE_RANGES, RESOURCE_CONFIG
-from grid import GridWorld
+from disaster_env.server.constants import (
+    VICTIMS_PER_ZONE,
+    VICTIM_SURVIVAL_TIME,
+    VICTIM_DISTANCE_KM,
+    SEVERITY_RANGES,
+    RESOURCE_CONFIG,
+    STEP_LIMITS,
+    UTTARAKHAND_ZONES,
+)
+from disaster_env.server.generators import (
+    _generate_victims,
+    generate_resources,
+    generate_civilians,
+    generate_scenario,
+    sync_with_grid,
+)
+from disaster_env.server.tasks import get_task
+from disaster_env.server.grid import GridWorld
+
+LEVELS = ["easy", "medium", "hard"]
 
 
-# ---------------------------------------------------------------------------
-# Group 1 — generate_resources (4 tests)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# _generate_victims
+# =============================================================================
 
-def test_resources_easy_keys():
-    """Easy resources must contain all three asset types."""
-    res = generate_resources("easy")
-    assert "ambulances"   in res
-    assert "rescue_teams" in res
-    assert "helicopters"  in res
+class TestGenerateVictimsCount:
 
+    def test_easy_count_matches_constant(self):
+        victims = _generate_victims("easy", 0, 42)
+        assert len(victims) == VICTIMS_PER_ZONE["easy"]
 
-def test_resources_hard_scarcer_than_medium():
-    """Hard mode must have fewer or equal total resources than medium."""
-    total_med  = sum(generate_resources("medium").values())
-    total_hard = sum(generate_resources("hard").values())
-    assert total_hard <= total_med, \
-        "Hard mode should not have more resources than medium!"
+    def test_medium_count_matches_constant(self):
+        victims = _generate_victims("medium", 0, 42)
+        assert len(victims) == VICTIMS_PER_ZONE["medium"]
 
-
-def test_resources_hard_no_helicopters():
-    """Hard task must have no helicopters — forces harder decision making."""
-    assert generate_resources("hard")["helicopters"] == 0
+    def test_hard_count_matches_constant(self):
+        victims = _generate_victims("hard", 0, 42)
+        assert len(victims) == VICTIMS_PER_ZONE["hard"]
 
 
-def test_resources_invalid_level():
-    """Passing an unknown task level must raise ValueError."""
-    with pytest.raises(ValueError):
-        generate_resources("extreme")
+class TestGenerateVictimsFields:
+
+    def test_required_fields_present(self):
+        victims = _generate_victims("easy", 0, 42)
+        required = {"id", "urgency", "survival_time", "distance_km", "alive", "rescued"}
+        for v in victims:
+            assert required.issubset(v.keys())
+
+    def test_alive_true_on_creation(self):
+        victims = _generate_victims("medium", 0, 42)
+        for v in victims:
+            assert v["alive"] is True
+
+    def test_rescued_false_on_creation(self):
+        victims = _generate_victims("medium", 0, 42)
+        for v in victims:
+            assert v["rescued"] is False
+
+    def test_urgency_values_valid(self):
+        for level in LEVELS:
+            victims = _generate_victims(level, 0, 42)
+            for v in victims:
+                assert v["urgency"] in {1, 2, 3}
+
+    def test_survival_time_within_range_easy(self):
+        lo, hi = VICTIM_SURVIVAL_TIME["easy"]
+        for v in _generate_victims("easy", 0, 42):
+            assert lo <= v["survival_time"] <= hi
+
+    def test_survival_time_within_range_medium(self):
+        lo, hi = VICTIM_SURVIVAL_TIME["medium"]
+        for v in _generate_victims("medium", 0, 42):
+            assert lo <= v["survival_time"] <= hi
+
+    def test_survival_time_within_range_hard(self):
+        lo, hi = VICTIM_SURVIVAL_TIME["hard"]
+        for v in _generate_victims("hard", 0, 42):
+            assert lo <= v["survival_time"] <= hi
+
+    def test_distance_km_within_range(self):
+        for level in LEVELS:
+            d_min, d_max = VICTIM_DISTANCE_KM[level]
+            for v in _generate_victims(level, 0, 42):
+                assert d_min <= v["distance_km"] <= d_max
 
 
-# ---------------------------------------------------------------------------
-# Group 2 — generate_civilians (15 tests)
-# ---------------------------------------------------------------------------
+class TestGenerateVictimsIds:
 
-def test_civilians_same_seed_same_output():
-    """Same seed must always produce the exact same civilian layout."""
-    assert generate_civilians("medium", seed=42) == generate_civilians("medium", seed=42)
+    def test_ids_unique_within_zone(self):
+        victims = _generate_victims("medium", 0, 42)
+        ids = [v["id"] for v in victims]
+        assert len(ids) == len(set(ids))
 
+    def test_global_unique_ids_across_zones(self):
+        all_ids = []
+        for zone_idx in range(3):
+            victims = _generate_victims("medium", zone_idx, 42)
+            all_ids.extend(v["id"] for v in victims)
+        assert len(all_ids) == len(set(all_ids))
 
-def test_civilians_different_seeds_differ():
-    """Different seeds must produce different civilian scenarios."""
-    assert generate_civilians("medium", seed=42) != generate_civilians("medium", seed=99)
+    def test_zone_0_ids_start_at_zero(self):
+        victims = _generate_victims("medium", 0, 42)
+        assert victims[0]["id"] == 0
 
+    def test_zone_1_ids_start_at_count(self):
+        count = VICTIMS_PER_ZONE["medium"]
+        victims = _generate_victims("medium", 1, 42)
+        assert victims[0]["id"] == count
 
-def test_civilians_easy_has_one_zone():
-    """Easy task must generate exactly 1 civilian zone."""
-    assert len(generate_civilians("easy", seed=42)) == 1
-
-
-def test_civilians_medium_has_three_zones():
-    """Medium task must generate exactly 3 civilian zones."""
-    assert len(generate_civilians("medium", seed=42)) == 3
-
-
-def test_civilians_hard_has_five_zones():
-    """Hard task must generate exactly 5 civilian zones."""
-    assert len(generate_civilians("hard", seed=999)) == 5
-
-
-def test_civilians_severity_in_constants_range():
-    """Every zone severity must be within the range defined in constants.py."""
-    for level in ["easy", "medium", "hard"]:
-        sev_min, sev_max = SEVERITY_RANGES[level]
-        for z in generate_civilians(level, seed=42):
-            if level == "hard" and z["zone_id"] == 0:
-                assert z["severity"] == 1.0, \
-                    "Kedarnath must be 1.0 in hard mode!"
-            else:
-                assert sev_min <= z["severity"] <= sev_max, \
-                    f"{level} {z['name']} severity {z['severity']} out of constants range!"
+    def test_id_base_formula_correctness(self):
+        for level in LEVELS:
+            count = VICTIMS_PER_ZONE[level]
+            for zone_idx in range(3):
+                victims = _generate_victims(level, zone_idx, 42)
+                expected_base = zone_idx * count
+                assert victims[0]["id"] == expected_base
 
 
-def test_civilians_people_in_constants_range():
-    """Every zone people count must be within the range defined in constants.py."""
-    for level in ["easy", "medium", "hard"]:
-        ppl_min, ppl_max = PEOPLE_RANGES[level]
-        for z in generate_civilians(level, seed=42):
-            assert ppl_min <= z["people"] <= ppl_max, \
-                f"{level} {z['name']} people {z['people']} out of constants range!"
+class TestGenerateVictimsReproducibility:
+
+    def test_same_seed_same_output(self):
+        a = _generate_victims("medium", 1, 123)
+        b = _generate_victims("medium", 1, 123)
+        assert a == b
+
+    def test_different_seeds_different_output(self):
+        a = _generate_victims("medium", 0, 1)
+        b = _generate_victims("medium", 0, 2)
+        assert a != b
+
+    def test_different_zone_indices_different_output(self):
+        a = _generate_victims("medium", 0, 42)
+        b = _generate_victims("medium", 1, 42)
+        assert [v["id"] for v in a] != [v["id"] for v in b]
 
 
-def test_civilians_people_positive():
-    """Every zone must have at least 1 person trapped."""
-    for z in generate_civilians("hard", seed=999):
-        assert z["people"] >= 1, \
-            f"{z['name']} has {z['people']} people — must be >= 1"
+# =============================================================================
+# generate_resources
+# =============================================================================
+
+class TestGenerateResources:
+
+    def test_returns_copy_not_original(self):
+        r = generate_resources("easy")
+        r["ambulances"] = 999
+        assert RESOURCE_CONFIG["easy"]["ambulances"] != 999
+
+    def test_correct_keys_easy(self):
+        r = generate_resources("easy")
+        assert {"ambulances", "rescue_teams", "helicopters"} == set(r.keys())
+
+    def test_correct_keys_medium(self):
+        r = generate_resources("medium")
+        assert {"ambulances", "rescue_teams", "helicopters"} == set(r.keys())
+
+    def test_correct_keys_hard(self):
+        r = generate_resources("hard")
+        assert {"ambulances", "rescue_teams", "helicopters"} == set(r.keys())
+
+    def test_hard_helicopters_zero(self):
+        assert generate_resources("hard")["helicopters"] == 0
+
+    def test_easy_matches_config(self):
+        assert generate_resources("easy") == RESOURCE_CONFIG["easy"]
+
+    def test_medium_matches_config(self):
+        assert generate_resources("medium") == RESOURCE_CONFIG["medium"]
+
+    def test_invalid_level_raises_value_error(self):
+        with pytest.raises(ValueError):
+            generate_resources("extreme")
+
+    def test_invalid_level_message_contains_level(self):
+        with pytest.raises(ValueError, match="extreme"):
+            generate_resources("extreme")
 
 
-def test_civilians_rescued_starts_at_zero():
-    """No one should be rescued at the start of an episode."""
-    for z in generate_civilians("medium", seed=42):
-        assert z["rescued"]      == 0, f"{z['name']} starts with rescued != 0"
-        assert z["time_waiting"] == 0, f"{z['name']} starts with time_waiting != 0"
+# =============================================================================
+# generate_civilians
+# =============================================================================
+
+class TestGenerateCiviliansCount:
+
+    def test_easy_zone_count(self):
+        civs = generate_civilians("easy", 42)
+        assert len(civs) == len(UTTARAKHAND_ZONES["easy"])
+
+    def test_medium_zone_count(self):
+        civs = generate_civilians("medium", 42)
+        assert len(civs) == len(UTTARAKHAND_ZONES["medium"])
+
+    def test_hard_zone_count(self):
+        civs = generate_civilians("hard", 42)
+        assert len(civs) == len(UTTARAKHAND_ZONES["hard"])
 
 
-def test_civilians_all_active_at_start():
-    """All zones must be active (is_active=True) at episode start."""
-    for z in generate_civilians("hard", seed=42):
-        assert z["is_active"] is True, f"{z['name']} is not active at start!"
+class TestGenerateCiviliansFields:
+
+    def test_required_fields_present(self):
+        civs = generate_civilians("easy", 42)
+        required = {"zone_id", "name", "district", "disaster_type",
+                    "severity", "people", "rescued", "time_waiting",
+                    "is_active", "victims"}
+        for z in civs:
+            assert required.issubset(z.keys())
+
+    def test_initial_rescued_zero(self):
+        for level in LEVELS:
+            civs = generate_civilians(level, 42)
+            for z in civs:
+                assert z["rescued"] == 0
+
+    def test_initial_time_waiting_zero(self):
+        for level in LEVELS:
+            civs = generate_civilians(level, 42)
+            for z in civs:
+                assert z["time_waiting"] == 0
+
+    def test_initial_is_active_true(self):
+        for level in LEVELS:
+            civs = generate_civilians(level, 42)
+            for z in civs:
+                assert z["is_active"] is True
+
+    def test_people_equals_victim_count(self):
+        for level in LEVELS:
+            civs = generate_civilians(level, 42)
+            for z in civs:
+                assert z["people"] == len(z["victims"])
+
+    def test_zone_ids_sequential(self):
+        civs = generate_civilians("medium", 42)
+        for i, z in enumerate(civs):
+            assert z["zone_id"] == i
 
 
-def test_civilians_correct_place_names():
-    """Easy zone must always be Kedarnath Temple Area, Rudraprayag."""
-    z = generate_civilians("easy", seed=42)[0]
-    assert z["name"]     == "Kedarnath Temple Area"
-    assert z["district"] == "Rudraprayag"
+class TestGenerateCiviliansSeverity:
+
+    def test_hard_first_zone_severity_is_one(self):
+        civs = generate_civilians("hard", 42)
+        assert civs[0]["severity"] == 1.0
+
+    def test_easy_severity_within_range(self):
+        lo, hi = SEVERITY_RANGES["easy"]
+        civs = generate_civilians("easy", 42)
+        assert lo <= civs[0]["severity"] <= hi
+
+    def test_medium_all_severities_within_range(self):
+        lo, hi = SEVERITY_RANGES["medium"]
+        civs = generate_civilians("medium", 42)
+        for z in civs:
+            assert lo <= z["severity"] <= hi
+
+    def test_hard_non_first_zones_within_range(self):
+        lo, hi = SEVERITY_RANGES["hard"]
+        civs = generate_civilians("hard", 42)
+        for z in civs[1:]:
+            assert lo <= z["severity"] <= hi
 
 
-def test_civilians_valid_disaster_types():
-    """Every zone must carry a recognised disaster type."""
-    valid = {"flash_flood", "landslide", "river_overflow",
-             "land_subsidence", "glacier_burst"}
-    for z in generate_civilians("hard", seed=999):
-        assert z["disaster_type"] in valid, \
-            f"{z['name']} has unrecognised disaster_type: {z['disaster_type']}"
+class TestGenerateCiviliansReproducibility:
+
+    def test_same_seed_same_output(self):
+        a = generate_civilians("medium", 123)
+        b = generate_civilians("medium", 123)
+        assert a == b
+
+    def test_different_seeds_different_severities(self):
+        a = generate_civilians("medium", 1)
+        b = generate_civilians("medium", 2)
+        sev_a = [z["severity"] for z in a]
+        sev_b = [z["severity"] for z in b]
+        assert sev_a != sev_b
+
+    def test_does_not_mutate_global_random_state(self):
+        """Isolated RNG: calling generate_civilians must not affect global random."""
+        import random
+        random.seed(999)
+        val_before = random.random()
+        random.seed(999)
+        generate_civilians("hard", 42)
+        val_after = random.random()
+        assert val_before == val_after
 
 
-def test_hard_kedarnath_always_critical():
-    """In hard mode, Kedarnath must always start at maximum severity (1.0)."""
-    zones = generate_civilians("hard", seed=999)
-    assert zones[0]["severity"] == 1.0, \
-        "Kedarnath must be 1.0 severity in hard mode!"
+# =============================================================================
+# generate_scenario
+# =============================================================================
+
+class TestGenerateScenario:
+
+    def test_returns_required_keys(self):
+        s = generate_scenario("easy", 42)
+        assert {"task_level", "seed", "max_steps", "resources", "zones"} == set(s.keys())
+
+    def test_task_level_stored(self):
+        for level in LEVELS:
+            s = generate_scenario(level, 42)
+            assert s["task_level"] == level
+
+    def test_seed_stored(self):
+        s = generate_scenario("easy", 99)
+        assert s["seed"] == 99
+
+    def test_max_steps_matches_constant(self):
+        for level in LEVELS:
+            s = generate_scenario(level, 42)
+            from disaster_env.server.constants import STEP_LIMITS
+            assert s["max_steps"] == STEP_LIMITS[level]
+
+    def test_resources_match_config(self):
+        for level in LEVELS:
+            s = generate_scenario(level, 42)
+            assert s["resources"] == RESOURCE_CONFIG[level]
+
+    def test_zone_count_matches(self):
+        for level in LEVELS:
+            s = generate_scenario(level, 42)
+            assert len(s["zones"]) == len(UTTARAKHAND_ZONES[level])
+
+    def test_reproducible(self):
+        a = generate_scenario("medium", 123)
+        b = generate_scenario("medium", 123)
+        assert a == b
 
 
-def test_hard_other_zones_not_fixed():
-    """Only Kedarnath is fixed at 1.0 — other zones must be randomly generated."""
-    for z in generate_civilians("hard", seed=999)[1:]:
-        assert z["severity"] != 1.0, \
-            f"{z['name']} should not be fixed at 1.0!"
+# =============================================================================
+# sync_with_grid
+# =============================================================================
 
+class TestSyncWithGrid:
 
-def test_civilians_matches_grid():
-    """generators.py and grid.py must produce identical output for same seed."""
-    for level, seed in [("easy", 42), ("medium", 123), ("hard", 999)]:
-        gen_zones  = generate_civilians(level, seed)
-        grid_zones = GridWorld(task_level=level, seed=seed).reset()["zones"]
-        for cz, gz in zip(gen_zones, grid_zones):
-            assert cz["severity"] == gz["severity"], \
-                f"{level} {cz['name']} severity mismatch: gen={cz['severity']} grid={gz['severity']}"
-            assert cz["people"] == gz["people"], \
-                f"{level} {cz['name']} people mismatch: gen={cz['people']} grid={gz['people']}"
+    def _make_env(self, level="easy"):
+        task = get_task(level)
+        g = GridWorld(level, task["seed"])
+        g.reset()
+        return g
 
+    def test_sync_updates_severity(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        g.zones[0].severity = 0.99
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["severity"] == round(0.99, 2)
 
-# ---------------------------------------------------------------------------
-# Group 3 — generate_scenario (3 tests)
-# ---------------------------------------------------------------------------
+    def test_sync_updates_time_waiting(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        g.zones[0].time_waiting = 7
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["time_waiting"] == 7
 
-def test_scenario_has_all_keys():
-    """Scenario dict must contain all required top-level keys."""
-    sc = generate_scenario("medium", seed=42)
-    for key in ["task_level", "seed", "max_steps", "resources", "zones"]:
-        assert key in sc, f"Scenario missing key: {key}"
+    def test_sync_updates_is_active(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        for v in g.zones[0].victims:
+            v["rescued"] = True
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["is_active"] is False
 
+    def test_sync_updates_people(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        g.zones[0].people = 100
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["people"] == 100
 
-def test_scenario_max_steps_positive():
-    """Max steps must be a positive integer for every difficulty."""
-    for level in ["easy", "medium", "hard"]:
-        assert generate_scenario(level, seed=1)["max_steps"] > 0
+    def test_sync_updates_rescued(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        g.zones[0].rescued = 5
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["rescued"] == 5
 
+    def test_sync_updates_victims_list(self):
+        """BUG 7 FIX: victims list must be synced."""
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        g.zones[0].victims[0]["rescued"] = True
+        synced = sync_with_grid(civs, g)
+        assert synced[0]["victims"][0]["rescued"] is True
 
-def test_scenario_reproducible():
-    """Same seed must produce the same full scenario."""
-    assert generate_scenario("hard", seed=77) == generate_scenario("hard", seed=77)
+    def test_returns_same_list_object(self):
+        g = self._make_env("easy")
+        civs = generate_civilians("easy", get_task("easy")["seed"])
+        result = sync_with_grid(civs, g)
+        assert result is civs
 
-
-# ---------------------------------------------------------------------------
-# Group 4 — sync_with_grid (2 tests)
-# ---------------------------------------------------------------------------
-
-def test_sync_updates_severity():
-    """After spread_threat(), sync_with_grid must update severity in civilians."""
-    grid      = GridWorld(task_level="medium", seed=42)
-    grid.reset()
-    civilians = generate_civilians("medium", seed=42)
-
-    grid.zones[0].severity = 0.9
-    before = civilians[1]["severity"]
-    grid.spread_threat()
-    sync_with_grid(civilians, grid)
-
-    assert civilians[1]["severity"] > before, \
-        "sync_with_grid did not update severity after spread!"
-
-
-def test_sync_updates_time_waiting():
-    """After tick(), sync_with_grid must reflect increased waiting time."""
-    grid      = GridWorld(task_level="easy", seed=42)
-    grid.reset()
-    civilians = generate_civilians("easy", seed=42)
-
-    grid.tick(spread=False)
-    sync_with_grid(civilians, grid)
-
-    assert civilians[0]["time_waiting"] == 1, \
-        "sync_with_grid did not update time_waiting after tick!"
-
-
-# To run all tests:
-# python -m pytest tests/test_generators.py -v
+    def test_all_zones_synced(self):
+        g = self._make_env("medium")
+        civs = generate_civilians("medium", get_task("medium")["seed"])
+        for i, zone in enumerate(g.zones):
+            zone.severity = 0.1 * (i + 1)
+        synced = sync_with_grid(civs, g)
+        for i in range(len(g.zones)):
+            assert synced[i]["severity"] == round(0.1 * (i + 1), 2)

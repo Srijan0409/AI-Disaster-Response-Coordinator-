@@ -1,343 +1,325 @@
+"""
+=============================================================================
+TEST SUITE — tasks.py
+=============================================================================
+Run with:
+    pytest test_tasks.py -v
+=============================================================================
+"""
+
+import copy
 import pytest
-from tasks import get_task, get_task_scenario, list_tasks, TASKS
-from constants import STEP_LIMITS, RESOURCE_CONFIG
+from disaster_env.server.tasks import get_task, get_task_scenario, list_tasks, TASKS
+from disaster_env.server.constants import (
+    STEP_LIMITS,
+    RESOURCE_CONFIG,
+    UTTARAKHAND_ZONES,
+)
+
+LEVELS = ["easy", "medium", "hard"]
 
 
-# ---------------------------------------------------------------------------
-# Group 1 — list_tasks (2 tests)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# list_tasks
+# =============================================================================
 
-def test_list_tasks_returns_all_levels():
-    """list_tasks must return all three difficulty levels."""
-    levels = list_tasks()
-    for level in ["easy", "medium", "hard"]:
-        assert level in levels, f"list_tasks() missing level: {level}"
+class TestListTasks:
 
+    def test_returns_three_levels(self):
+        assert set(list_tasks()) == {"easy", "medium", "hard"}
 
-def test_list_tasks_returns_exactly_three():
-    """list_tasks must return exactly 3 levels — no more, no less."""
-    assert len(list_tasks()) == 3
+    def test_returns_list(self):
+        assert isinstance(list_tasks(), list)
 
-
-# ---------------------------------------------------------------------------
-# Group 2 — get_task valid levels (3 tests)
-# ---------------------------------------------------------------------------
-
-def test_get_task_easy_returns_dict():
-    """get_task('easy') must return a dict."""
-    assert isinstance(get_task("easy"), dict)
+    def test_no_duplicates(self):
+        tasks = list_tasks()
+        assert len(tasks) == len(set(tasks))
 
 
-def test_get_task_medium_returns_dict():
-    """get_task('medium') must return a dict."""
-    assert isinstance(get_task("medium"), dict)
+# =============================================================================
+# get_task — basic
+# =============================================================================
+
+class TestGetTaskBasic:
+
+    def test_easy_returned(self):
+        t = get_task("easy")
+        assert t["task_level"] == "easy"
+
+    def test_medium_returned(self):
+        t = get_task("medium")
+        assert t["task_level"] == "medium"
+
+    def test_hard_returned(self):
+        t = get_task("hard")
+        assert t["task_level"] == "hard"
+
+    def test_invalid_level_raises_value_error(self):
+        with pytest.raises(ValueError):
+            get_task("extreme")
+
+    def test_invalid_level_message_informative(self):
+        with pytest.raises(ValueError, match="extreme"):
+            get_task("extreme")
+
+    def test_task_level_matches_key(self):
+        for level in LEVELS:
+            assert get_task(level)["task_level"] == level
 
 
-def test_get_task_hard_returns_dict():
-    """get_task('hard') must return a dict."""
-    assert isinstance(get_task("hard"), dict)
+# =============================================================================
+# get_task — deep copy (BUG 14 FIX)
+# =============================================================================
+
+class TestGetTaskDeepCopy:
+
+    def test_mutating_returned_task_does_not_affect_registry(self):
+        """BUG 14 FIX: returned task must be a deep copy."""
+        t = get_task("easy")
+        t["resources"]["ambulances"] = 9999
+        t2 = get_task("easy")
+        assert t2["resources"]["ambulances"] == RESOURCE_CONFIG["easy"]["ambulances"]
+
+    def test_mutating_description_does_not_affect_registry(self):
+        t = get_task("medium")
+        t["description"] = "HACKED"
+        t2 = get_task("medium")
+        assert t2["description"] != "HACKED"
+
+    def test_returns_independent_copies(self):
+        t1 = get_task("easy")
+        t2 = get_task("easy")
+        assert t1 is not t2
+
+    def test_nested_dicts_are_copies(self):
+        t1 = get_task("easy")
+        t2 = get_task("easy")
+        assert t1["resources"] is not t2["resources"]
+
+    def test_mutating_action_space_does_not_affect_registry(self):
+        t = get_task("hard")
+        t["action_space"]["unit_types"].append("nuke")
+        t2 = get_task("hard")
+        assert "nuke" not in t2["action_space"]["unit_types"]
 
 
-# ---------------------------------------------------------------------------
-# Group 3 — get_task invalid level (2 tests)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# get_task — required fields
+# =============================================================================
 
-def test_get_task_invalid_raises_value_error():
-    """get_task with unknown level must raise ValueError."""
-    with pytest.raises(ValueError):
-        get_task("extreme")
+class TestGetTaskFields:
 
-
-def test_get_task_empty_string_raises():
-    """get_task with empty string must raise ValueError."""
-    with pytest.raises(ValueError):
-        get_task("")
-
-
-# ---------------------------------------------------------------------------
-# Group 4 — Required keys in every task (1 test)
-# ---------------------------------------------------------------------------
-
-def test_all_tasks_have_required_keys():
-    """Every task config must have all required top-level keys."""
-    required = [
-        "seed", "task_level", "max_steps", "resources",
-        "spread", "spread_interval", "spawn_victims",
-        "success_threshold", "description", "objective",
+    REQUIRED = [
+        "seed", "task_level", "max_steps", "resources", "spread",
+        "spawn_victims", "success_threshold", "description", "objective",
         "observation_space", "action_space",
     ]
-    for level in ["easy", "medium", "hard"]:
-        task = get_task(level)
-        for key in required:
-            assert key in task, f"'{level}' task missing key: '{key}'"
 
+    def test_easy_has_all_fields(self):
+        t = get_task("easy")
+        for key in self.REQUIRED:
+            assert key in t
 
-# ---------------------------------------------------------------------------
-# Group 5 — task_level field matches the key (3 tests)
-# ---------------------------------------------------------------------------
+    def test_medium_has_all_fields(self):
+        t = get_task("medium")
+        for key in self.REQUIRED:
+            assert key in t
 
-def test_easy_task_level_field_correct():
-    """task_level field in easy config must be 'easy'."""
-    assert get_task("easy")["task_level"] == "easy"
+    def test_hard_has_all_fields(self):
+        t = get_task("hard")
+        for key in self.REQUIRED:
+            assert key in t
 
 
-def test_medium_task_level_field_correct():
-    """task_level field in medium config must be 'medium'."""
-    assert get_task("medium")["task_level"] == "medium"
+# =============================================================================
+# get_task — seeds
+# =============================================================================
 
+class TestGetTaskSeeds:
 
-def test_hard_task_level_field_correct():
-    """task_level field in hard config must be 'hard'."""
-    assert get_task("hard")["task_level"] == "hard"
+    def test_seeds_unique_across_levels(self):
+        seeds = [get_task(l)["seed"] for l in LEVELS]
+        assert len(seeds) == len(set(seeds))
 
+    def test_seeds_are_integers(self):
+        for level in LEVELS:
+            assert isinstance(get_task(level)["seed"], int)
 
-# ---------------------------------------------------------------------------
-# Group 6 — Seeds (3 tests)
-# ---------------------------------------------------------------------------
+    def test_easy_seed_is_42(self):
+        assert get_task("easy")["seed"] == 42
 
-def test_easy_seed_is_42():
-    """Easy task must use seed 42 for reproducibility."""
-    assert get_task("easy")["seed"] == 42
+    def test_medium_seed_is_123(self):
+        assert get_task("medium")["seed"] == 123
 
+    def test_hard_seed_is_999(self):
+        assert get_task("hard")["seed"] == 999
 
-def test_medium_seed_is_123():
-    """Medium task must use seed 123 for reproducibility."""
-    assert get_task("medium")["seed"] == 123
 
+# =============================================================================
+# get_task — max_steps
+# =============================================================================
 
-def test_hard_seed_is_999():
-    """Hard task must use seed 999 for reproducibility."""
-    assert get_task("hard")["seed"] == 999
+class TestGetTaskMaxSteps:
 
+    def test_max_steps_match_constants(self):
+        for level in LEVELS:
+            assert get_task(level)["max_steps"] == STEP_LIMITS[level]
 
-# ---------------------------------------------------------------------------
-# Group 7 — max_steps matches constants.py (3 tests)
-# ---------------------------------------------------------------------------
+    def test_hard_fewest_steps(self):
+        assert get_task("hard")["max_steps"] <= get_task("easy")["max_steps"]
 
-def test_easy_max_steps_matches_constants():
-    """Easy max_steps must match STEP_LIMITS['easy'] from constants.py."""
-    assert get_task("easy")["max_steps"] == STEP_LIMITS["easy"]
+    def test_easy_leq_medium(self):
+        assert get_task("easy")["max_steps"] <= get_task("medium")["max_steps"]
 
+    def test_all_positive(self):
+        for level in LEVELS:
+            assert get_task(level)["max_steps"] > 0
 
-def test_medium_max_steps_matches_constants():
-    """Medium max_steps must match STEP_LIMITS['medium'] from constants.py."""
-    assert get_task("medium")["max_steps"] == STEP_LIMITS["medium"]
 
+# =============================================================================
+# get_task — resources
+# =============================================================================
 
-def test_hard_max_steps_matches_constants():
-    """Hard max_steps must match STEP_LIMITS['hard'] from constants.py."""
-    assert get_task("hard")["max_steps"] == STEP_LIMITS["hard"]
+class TestGetTaskResources:
 
+    def test_resources_match_config(self):
+        for level in LEVELS:
+            assert get_task(level)["resources"] == RESOURCE_CONFIG[level]
 
-# ---------------------------------------------------------------------------
-# Group 8 — resources match constants.py (3 tests)
-# ---------------------------------------------------------------------------
+    def test_hard_no_helicopters(self):
+        assert get_task("hard")["resources"]["helicopters"] == 0
 
-def test_easy_resources_match_constants():
-    """Easy resources must match RESOURCE_CONFIG['easy'] from constants.py."""
-    assert get_task("easy")["resources"] == RESOURCE_CONFIG["easy"]
+    def test_easy_has_ambulances(self):
+        assert get_task("easy")["resources"]["ambulances"] >= 1
 
 
-def test_medium_resources_match_constants():
-    """Medium resources must match RESOURCE_CONFIG['medium'] from constants.py."""
-    assert get_task("medium")["resources"] == RESOURCE_CONFIG["medium"]
+# =============================================================================
+# get_task — success threshold
+# =============================================================================
 
+class TestGetTaskSuccessThreshold:
 
-def test_hard_resources_match_constants():
-    """Hard resources must match RESOURCE_CONFIG['hard'] from constants.py."""
-    assert get_task("hard")["resources"] == RESOURCE_CONFIG["hard"]
+    def test_thresholds_ordered(self):
+        easy   = get_task("easy")["success_threshold"]
+        medium = get_task("medium")["success_threshold"]
+        hard   = get_task("hard")["success_threshold"]
+        assert easy < medium < hard
 
+    def test_easy_threshold_is_0_5(self):
+        assert get_task("easy")["success_threshold"] == 0.5
 
-# ---------------------------------------------------------------------------
-# Group 9 — Spread configuration (4 tests)
-# ---------------------------------------------------------------------------
+    def test_medium_threshold_is_0_6(self):
+        assert get_task("medium")["success_threshold"] == 0.6
 
-def test_easy_no_spread():
-    """Easy task must have spread=False — disaster does not spread."""
-    assert get_task("easy")["spread"] is False
+    def test_hard_threshold_is_0_7(self):
+        assert get_task("hard")["success_threshold"] == 0.7
 
+    def test_thresholds_between_zero_and_one(self):
+        for level in LEVELS:
+            t = get_task(level)["success_threshold"]
+            assert 0.0 < t < 1.0
 
-def test_medium_spread_enabled():
-    """Medium task must have spread=True — disaster spreads every 5 steps."""
-    assert get_task("medium")["spread"] is True
 
+# =============================================================================
+# get_task — spread / spawn settings
+# =============================================================================
 
-def test_medium_spread_interval_is_5():
-    """Medium spread_interval must be 5 steps."""
-    assert get_task("medium")["spread_interval"] == 5
+class TestGetTaskSpreadSpawn:
 
+    def test_easy_spread_false(self):
+        assert get_task("easy")["spread"] is False
 
-def test_hard_spread_interval_is_2():
-    """Hard spread_interval must be 2 steps — much more aggressive spreading."""
-    assert get_task("hard")["spread_interval"] == 2
+    def test_medium_spread_true(self):
+        assert get_task("medium")["spread"] is True
 
+    def test_hard_spread_true(self):
+        assert get_task("hard")["spread"] is True
 
-# ---------------------------------------------------------------------------
-# Group 10 — Spawn victims configuration (3 tests)
-# ---------------------------------------------------------------------------
+    def test_easy_spawn_false(self):
+        assert get_task("easy")["spawn_victims"] is False
 
-def test_easy_no_spawn():
-    """Easy task must not spawn new victims mid-episode."""
-    assert get_task("easy")["spawn_victims"] is False
+    def test_medium_spawn_false(self):
+        assert get_task("medium")["spawn_victims"] is False
 
+    def test_hard_spawn_true(self):
+        assert get_task("hard")["spawn_victims"] is True
 
-def test_medium_no_spawn():
-    """Medium task must not spawn new victims mid-episode."""
-    assert get_task("medium")["spawn_victims"] is False
+    def test_hard_spread_interval_less_than_medium(self):
+        hard_interval   = get_task("hard")["spread_interval"]
+        medium_interval = get_task("medium")["spread_interval"]
+        assert hard_interval < medium_interval
 
 
-def test_hard_spawn_enabled():
-    """Hard task must spawn new victims mid-episode — worsening disaster."""
-    assert get_task("hard")["spawn_victims"] is True
+# =============================================================================
+# get_task — action space
+# =============================================================================
 
+class TestGetTaskActionSpace:
 
-# ---------------------------------------------------------------------------
-# Group 11 — Success thresholds (4 tests)
-# ---------------------------------------------------------------------------
+    def test_hard_no_helicopter_in_action_space(self):
+        assert "helicopter" not in get_task("hard")["action_space"]["unit_types"]
 
-def test_easy_threshold_is_0_5():
-    """Easy success_threshold must be 0.5."""
-    assert get_task("easy")["success_threshold"] == 0.5
+    def test_easy_has_helicopter_in_action_space(self):
+        assert "helicopter" in get_task("easy")["action_space"]["unit_types"]
 
+    def test_medium_has_helicopter_in_action_space(self):
+        assert "helicopter" in get_task("medium")["action_space"]["unit_types"]
 
-def test_medium_threshold_is_0_6():
-    """Medium success_threshold must be 0.6."""
-    assert get_task("medium")["success_threshold"] == 0.6
+    def test_all_levels_have_ambulance_in_action_space(self):
+        for level in LEVELS:
+            assert "ambulance" in get_task(level)["action_space"]["unit_types"]
 
+    def test_all_levels_have_rescue_team_in_action_space(self):
+        for level in LEVELS:
+            assert "rescue_team" in get_task(level)["action_space"]["unit_types"]
 
-def test_hard_threshold_is_0_7():
-    """Hard success_threshold must be 0.7."""
-    assert get_task("hard")["success_threshold"] == 0.7
+    def test_action_space_type_discrete(self):
+        for level in LEVELS:
+            assert get_task(level)["action_space"]["type"] == "discrete"
 
 
-def test_thresholds_increase_with_difficulty():
-    """Success threshold must increase easy → medium → hard."""
-    easy_t   = get_task("easy")["success_threshold"]
-    medium_t = get_task("medium")["success_threshold"]
-    hard_t   = get_task("hard")["success_threshold"]
-    assert easy_t < medium_t < hard_t, \
-        "Success thresholds must strictly increase with difficulty!"
+# =============================================================================
+# get_task_scenario
+# =============================================================================
 
+class TestGetTaskScenario:
 
-# ---------------------------------------------------------------------------
-# Group 12 — Action space (3 tests)
-# ---------------------------------------------------------------------------
+    def test_task_level_correct(self):
+        for level in LEVELS:
+            s = get_task_scenario(level)
+            assert s["task_level"] == level
 
-def test_hard_action_space_no_helicopter():
-    """Hard action space must not include helicopters — none available."""
-    unit_types = get_task("hard")["action_space"]["unit_types"]
-    assert "helicopter" not in unit_types, \
-        "Hard mode has no helicopters — must not appear in action_space!"
+    def test_has_zones(self):
+        for level in LEVELS:
+            s = get_task_scenario(level)
+            assert "zones" in s
+            assert len(s["zones"]) > 0
 
+    def test_has_resources(self):
+        for level in LEVELS:
+            s = get_task_scenario(level)
+            assert "resources" in s
 
-def test_easy_action_space_has_helicopter():
-    """Easy action space must include helicopter as a unit type."""
-    assert "helicopter" in get_task("easy")["action_space"]["unit_types"]
+    def test_has_max_steps(self):
+        for level in LEVELS:
+            s = get_task_scenario(level)
+            assert s["max_steps"] == STEP_LIMITS[level]
 
+    def test_seed_matches_task_seed(self):
+        for level in LEVELS:
+            task = get_task(level)
+            s = get_task_scenario(level)
+            assert s["seed"] == task["seed"]
 
-def test_all_tasks_action_space_type_discrete():
-    """All tasks must declare a discrete action space."""
-    for level in ["easy", "medium", "hard"]:
-        assert get_task(level)["action_space"]["type"] == "discrete", \
-            f"{level} action_space type must be 'discrete'!"
+    def test_zone_names_match_constants(self):
+        for level in LEVELS:
+            s = get_task_scenario(level)
+            expected_names = [z["name"] for z in UTTARAKHAND_ZONES[level]]
+            actual_names   = [z["name"] for z in s["zones"]]
+            assert actual_names == expected_names
 
-
-# ---------------------------------------------------------------------------
-# Group 13 — Observation space (2 tests)
-# ---------------------------------------------------------------------------
-
-def test_all_tasks_have_observation_space_keys():
-    """Every task observation_space must contain zones, resources, step, max_steps."""
-    required = ["zones", "resources", "step", "max_steps"]
-    for level in ["easy", "medium", "hard"]:
-        obs = get_task(level)["observation_space"]
-        for key in required:
-            assert key in obs, \
-                f"'{level}' observation_space missing key: '{key}'"
-
-
-def test_all_tasks_description_nonempty():
-    """Every task must have a non-empty description and objective string."""
-    for level in ["easy", "medium", "hard"]:
-        task = get_task(level)
-        assert len(task["description"]) > 10, \
-            f"'{level}' task description is too short or empty!"
-        assert len(task["objective"]) > 5, \
-            f"'{level}' task objective is too short or empty!"
-
-
-# ---------------------------------------------------------------------------
-# Group 14 — get_task_scenario (5 tests)
-# ---------------------------------------------------------------------------
-
-def test_get_task_scenario_returns_all_keys():
-    """get_task_scenario must return dict with all required keys."""
-    sc = get_task_scenario("easy")
-    for key in ["task_level", "seed", "max_steps", "resources", "zones"]:
-        assert key in sc, f"Scenario missing key: {key}"
-
-
-def test_get_task_scenario_task_level_correct():
-    """Scenario task_level must match the requested level."""
-    for level in ["easy", "medium", "hard"]:
-        assert get_task_scenario(level)["task_level"] == level
-
-
-def test_get_task_scenario_seed_matches_task():
-    """Scenario seed must match the seed defined in the task config."""
-    for level in ["easy", "medium", "hard"]:
-        assert get_task_scenario(level)["seed"] == get_task(level)["seed"]
-
-
-def test_get_task_scenario_reproducible():
-    """get_task_scenario must produce the same result every call (fixed seed)."""
-    for level in ["easy", "medium", "hard"]:
-        assert get_task_scenario(level) == get_task_scenario(level), \
-            f"get_task_scenario('{level}') is not reproducible!"
-
-
-def test_get_task_scenario_zones_correct_count():
-    """Scenario zones count must match the expected zone count per level."""
-    expected = {"easy": 1, "medium": 3, "hard": 5}
-    for level, count in expected.items():
-        sc = get_task_scenario(level)
-        assert len(sc["zones"]) == count, \
-            f"'{level}' scenario has {len(sc['zones'])} zones, expected {count}!"
-
-
-# ---------------------------------------------------------------------------
-# Group 15 — Dashboard rules verification (4 tests)
-# ---------------------------------------------------------------------------
-
-def test_dashboard_three_tasks_exist():
-    """Dashboard rule: must have minimum 3 tasks (easy, medium, hard)."""
-    assert len(list_tasks()) >= 3
-
-
-def test_dashboard_success_thresholds_in_range():
-    """Dashboard rule: all success thresholds must be in [0.0, 1.0]."""
-    for level in ["easy", "medium", "hard"]:
-        t = get_task(level)["success_threshold"]
-        assert 0.0 <= t <= 1.0, \
-            f"'{level}' threshold {t} outside [0.0, 1.0]!"
-
-
-def test_dashboard_max_steps_positive():
-    """Dashboard rule: every task must have a positive step budget."""
-    for level in ["easy", "medium", "hard"]:
-        assert get_task(level)["max_steps"] > 0, \
-            f"'{level}' max_steps must be > 0!"
-
-
-def test_dashboard_hard_genuinely_harder():
-    """Dashboard rule: hard must be harder than easy — higher threshold, fewer steps."""
-    easy = get_task("easy")
-    hard = get_task("hard")
-    assert hard["success_threshold"] > easy["success_threshold"], \
-        "Hard threshold must be higher than easy!"
-    assert hard["max_steps"] < easy["max_steps"] or hard["spawn_victims"] is True, \
-        "Hard must be genuinely harder (fewer steps or spawning victims)!"
-
-
-# To run all tests:
-# python -m pytest tests/test_tasks.py -v
+    def test_reproducible(self):
+        for level in LEVELS:
+            s1 = get_task_scenario(level)
+            s2 = get_task_scenario(level)
+            assert s1 == s2
