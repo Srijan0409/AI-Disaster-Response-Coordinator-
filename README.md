@@ -1,31 +1,45 @@
 ---
+
 title: Disaster Env
 emoji: 🚑
 colorFrom: blue
 colorTo: green
 sdk: docker
 app_port: 8000
----
+--------------
 
 # AI Disaster Response Coordinator
 
 > Meta PyTorch x Scaler School of Technology - OpenEnv Hackathon Round 1
 
-An OpenEnv-compatible reinforcement learning environment simulating real-world multi-zone disaster response coordination. Based on the 2013 Uttarakhand floods and Kedarnath disaster scenario - one of India's most severe natural disasters.
+An OpenEnv-compatible reinforcement learning environment simulating **real-world disaster response coordination**, inspired by the 2013 Uttarakhand floods and Kedarnath disaster — one of India's most severe natural disasters.
 
-An AI agent coordinates ambulances, rescue teams, and helicopters across multiple disaster zones, triaging victims under time pressure, spreading threats, and dynamic victim spawning.
+This environment models how emergency authorities (NDRF/SDRF) must allocate limited resources across multiple disaster zones under time pressure.
 
 ---
 
-## Environment Description
+##  Environment Description
 
-The environment models emergency triage decision-making - a task real disaster response coordinators perform under severe constraints:
+The environment simulates real-world emergency triage decision-making:
 
-* Multiple disaster zones with different severities, victim counts, and disaster types
+* Multiple disaster zones with varying severity
 * Limited rescue resources (ambulances, rescue teams, helicopters)
-* Spreading threats - high-severity zones infect adjacent zones over time
-* Victim survival decay - victims die if not rescued within their survival window
-* Hard triage decisions - not all victims can be saved; prioritisation matters
+* Victim survival windows (delayed rescue leads to death)
+* Spreading disasters across zones
+* Dynamic victim spawning in harder scenarios
+
+Agents must make **high-stakes prioritization decisions** to maximize survival outcomes.
+
+---
+
+##  OpenEnv Compliance
+
+This environment fully implements the OpenEnv specification:
+
+* `reset()` → Initializes environment state
+* `step(action)` → Returns `(state, reward, done, info)`
+* `state()` → Returns current observable state
+* `openenv.yaml` → Defines API schema and environment contract
 
 ---
 
@@ -39,36 +53,116 @@ The environment models emergency triage decision-making - a task real disaster r
 
 ---
 
-## Action Space
+##  Action Space
 
+```python
 DisasterAction(
-zone_id: int,
-unit_type: str  # ambulance | rescue_team | helicopter
+    zone_id: int,
+    unit_type: str  # ambulance | rescue_team | helicopter
 )
+```
 
 ---
 
-## Setup
+##  Observation Space
 
+Each state includes:
+
+* `zone_id`
+* `severity_level`
+* `active_victims`
+* `remaining_survival_time`
+* `available_resources`
+* `disaster_spread_status`
+
+---
+
+## Reward Function
+
+The reward is carefully designed to reflect real-world priorities and is **strictly bounded between (0, 1)**:
+
+* +0.10 → Successful rescue
+* +0.05 → Prioritizing high-severity zones
+* -0.05 → Victim death due to delay
+* -0.02 → Inefficient resource allocation
+
+###  Final Score Rule:
+
+> Final score is **strictly between 0 and 1 (not inclusive)** to satisfy evaluation constraints.
+
+---
+
+##  Evaluation / Grader
+
+Each task is evaluated using an automated grader:
+
+* Tracks number of rescued victims
+* Penalizes deaths and delayed actions
+* Rewards efficient and strategic coordination
+
+The final score is normalized in the range **(0, 1)**.
+
+⚠️ Submissions fail if:
+
+* Score ≤ 0
+* Score ≥ 1
+
+---
+
+##  Baseline Agent
+
+A baseline inference script is provided:
+
+```bash
+python inference.py
+```
+
+Output format:
+
+```
+[START] task=<task_name> env=<env_name> model=<model>
+[STEP] step=<n> action=<action> reward=<r>
+[END] final_score=<score>
+```
+
+---
+
+##  Setup
+
+```bash
 git clone https://github.com/YOUR_USERNAME/disaster_env
 cd disaster_env
 pip install -e .
+```
 
 ---
 
-## Run
+##  Run Server
 
+```bash
 uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
 
 ---
 
-## Docker
+##  Docker
 
+```bash
 docker build -t disaster_env:latest .
 docker run -p 8000:8000 disaster_env:latest
+```
 
 ---
 
-## License
+##  Deployment
+
+This environment is deployed on **Hugging Face Spaces** using Docker.
+
+* Public API Endpoint: `https://huggingface.co/spaces/ayush4650/disaster-env-v2`
+* Fully OpenEnv-compatible API
+
+---
+
+##  License
 
 BSD 3-Clause
