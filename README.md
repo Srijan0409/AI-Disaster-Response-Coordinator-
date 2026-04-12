@@ -1,6 +1,6 @@
 ---
 title: "Disaster Env"
-emoji: "ambulance"
+emoji: "🚑"
 colorFrom: "blue"
 colorTo: "green"
 sdk: "docker"
