@@ -13,7 +13,9 @@ app_port: 8000
 
 An OpenEnv-compatible reinforcement learning environment simulating **real-world disaster response coordination**, inspired by the 2013 Uttarakhand floods and Kedarnath disaster — one of India's most severe natural disasters.
 
-This environment models how emergency authorities (NDRF/SDRF) must allocate limited resources across multiple disaster zones under time pressure.
+This environment models how emergency authorities (NDRF/SDRF) must allocate limited resources across multiple disaster zones under time pressure. 
+
+Live demo: https://huggingface.co/spaces/ayush4650/disaster-env-v2
 
 ---
 
